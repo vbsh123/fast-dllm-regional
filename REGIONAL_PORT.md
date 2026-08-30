@@ -37,6 +37,9 @@ cd v1
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
+# Fast-dLLM does not pin torch.  Pin a CUDA 12.1 wheel that is compatible with
+# the 570-series drivers used by the target Vast image.
+python -m pip install "torch==2.5.1" --index-url https://download.pytorch.org/whl/cu121
 python -m pip install -r requirements.txt
 cd dream
 ```
