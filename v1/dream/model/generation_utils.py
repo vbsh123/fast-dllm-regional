@@ -35,6 +35,12 @@ from transformers.utils import (
     logging,
 )
 
+from .regional_scheduler import (
+    build_regions,
+    controlled_regions,
+    linear_transfer_count,
+)
+
 logger = logging.get_logger(__name__)
 
 
@@ -98,6 +104,213 @@ def sample_tokens(logits, temperature=0.0, top_p=None, top_k=None, margin_confid
 class DreamModelOutput(ModelOutput):
     sequences: torch.LongTensor = None
     history: Optional[Tuple[torch.FloatTensor]] = None
+    stats: Optional[Dict[str, Any]] = None
+
+
+def _regional_sample(
+    model,
+    x,
+    *,
+    attention_mask,
+    tok_idx,
+    prompt_length,
+    mask_token_id,
+    eos_token_ids,
+    eps,
+    temperature,
+    top_p,
+    top_k,
+    alg_temp,
+    commit_policy,
+    region_size,
+    local_steps,
+    max_progress_gap,
+    deferral_threshold,
+    deferral_until_revealed,
+    max_global_deferrals,
+    tail_guard,
+    generation_tokens_hook_func,
+    generation_logits_hook_func,
+    histories,
+    started_at,
+):
+    """Run the balanced fixed-region pilot on Fast-dLLM's full-canvas path."""
+    if x.shape[0] != 1:
+        raise ValueError("regional_balanced currently requires batch_size=1")
+    generation_length = x.shape[1] - prompt_length
+    states = build_regions(generation_length, region_size)
+    if local_steps <= 0:
+        raise ValueError("regional_local_steps must be positive")
+    if not 0.0 <= deferral_threshold <= 1.0:
+        raise ValueError("regional_deferral_threshold must be in [0, 1]")
+    if deferral_until_revealed < 0:
+        raise ValueError("regional_deferral_until_revealed must be non-negative")
+    if max_global_deferrals <= 0:
+        raise ValueError("regional_max_global_deferrals must be positive")
+    if commit_policy not in {"maskgit_plus", "topk_margin", "entropy"}:
+        raise ValueError(
+            "regional_commit_policy must be maskgit_plus, topk_margin, or entropy"
+        )
+
+    eos_token_ids = {int(token) for token in eos_token_ids}
+    global_empty_deferral_streak = 0
+    nfe = 0
+    total_committed = 0
+    deferral_events = 0
+    gap_forced_events = 0
+    tail_guard_iterations = 0
+    blocked_region_events = 0
+    max_iterations = local_steps * (len(states) + 2) * (max_global_deferrals + 1)
+
+    while bool((x[:, prompt_length:] == mask_token_id).any()):
+        response_mask = x[0, prompt_length:] == mask_token_id
+        remaining = [
+            int(response_mask[state.start:state.end].sum().item()) for state in states
+        ]
+        logits = model(x, attention_mask, tok_idx).logits
+        logits = torch.cat([logits[:, :1], logits[:, :-1]], dim=1)
+        logits = generation_logits_hook_func(nfe, x, logits)
+        nfe += 1
+
+        absolute_mask = x == mask_token_id
+        absolute_mask[:, :prompt_length] = False
+        mask_logits = logits[absolute_mask]
+        confidence, predictions = sample_tokens(
+            mask_logits,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            margin_confidence=commit_policy == "topk_margin",
+            neg_entropy=commit_policy == "entropy",
+        )
+        full_confidence = torch.full_like(x, -torch.inf, dtype=logits.dtype)
+        full_confidence[absolute_mask] = confidence.to(logits.dtype)
+        full_predictions = x.clone()
+        full_predictions[absolute_mask] = predictions
+        raw_top1_probability = mask_logits.float().softmax(dim=-1).max(dim=-1).values
+        full_top1_probability = torch.zeros_like(x, dtype=torch.float32)
+        full_top1_probability[absolute_mask] = raw_top1_probability
+
+        guarded_tail = None
+        if tail_guard and eos_token_ids:
+            response_predictions = logits[0, prompt_length:].argmax(dim=-1)
+            predicted_stop = torch.zeros_like(response_predictions, dtype=torch.bool)
+            for token_id in eos_token_ids:
+                predicted_stop |= response_predictions == token_id
+            stop_candidates = torch.nonzero(
+                response_mask & predicted_stop, as_tuple=False
+            )
+            if stop_candidates.numel() > 0:
+                stop_position = int(stop_candidates[0, 0].item())
+                candidate_tail = next(
+                    state.index
+                    for state in states
+                    if state.start <= stop_position < state.end
+                )
+                if any(value > 0 for value in remaining[:candidate_tail]):
+                    guarded_tail = candidate_tail
+                    tail_guard_iterations += 1
+
+        active, blocked, urgent = controlled_regions(
+            states,
+            remaining_masks=remaining,
+            local_steps=local_steps,
+            max_progress_gap=max_progress_gap,
+            max_region_exclusive=guarded_tail,
+        )
+        blocked_region_events += len(blocked)
+        if not active:
+            raise RuntimeError(
+                "regional_balanced deadlocked with masks remaining; "
+                f"remaining={remaining}, guarded_tail={guarded_tail}"
+            )
+
+        forced_reasons = {index: "gap" for index in urgent}
+        for index in active:
+            if states[index].size - remaining[index] >= deferral_until_revealed:
+                forced_reasons.setdefault(index, "deferral_window_closed")
+        if global_empty_deferral_streak >= max_global_deferrals and not forced_reasons:
+            forced_reasons[active[0]] = "global_deadlock"
+
+        deferred: set[int] = set()
+        committed_this_forward = 0
+        for index in active:
+            state = states[index]
+            relative_positions = torch.arange(
+                state.start, state.end, device=x.device, dtype=torch.long
+            )
+            relative_positions = relative_positions[response_mask[relative_positions]]
+            count = linear_transfer_count(
+                int(relative_positions.numel()),
+                schedule_step=state.schedule_step,
+                local_steps=local_steps,
+                eps=eps,
+            )
+            if count == 0:
+                state.schedule_step += 1
+                continue
+
+            count = min(count, int(relative_positions.numel()))
+            absolute_positions = relative_positions + prompt_length
+            scores = full_confidence[0, absolute_positions]
+            if alg_temp is None or alg_temp == 0:
+                chosen = torch.topk(scores, k=count).indices
+            else:
+                weights = F.softmax(scores / alg_temp, dim=-1)
+                chosen = torch.multinomial(weights, num_samples=count)
+            selected_absolute = absolute_positions[chosen]
+            minimum_probability = float(
+                full_top1_probability[0, selected_absolute].min().item()
+            )
+            force_reason = forced_reasons.get(index)
+            if minimum_probability < deferral_threshold and force_reason is None:
+                state.deferrals += 1
+                deferred.add(index)
+                deferral_events += 1
+                continue
+
+            if minimum_probability < deferral_threshold and force_reason == "gap":
+                gap_forced_events += 1
+            state.deferrals = 0
+            x[0, selected_absolute] = full_predictions[0, selected_absolute]
+            state.schedule_step += 1
+            committed_this_forward += int(selected_absolute.numel())
+
+        total_committed += committed_this_forward
+        if committed_this_forward == 0 and deferred:
+            global_empty_deferral_streak += 1
+        else:
+            global_empty_deferral_streak = 0
+
+        x = generation_tokens_hook_func(nfe - 1, x, logits)
+        if histories is not None:
+            histories.append(x.clone())
+        if nfe > max_iterations:
+            raise RuntimeError(
+                f"regional_balanced exceeded safety limit of {max_iterations} NFEs"
+            )
+
+    if x.device.type == "cuda":
+        torch.cuda.synchronize(x.device)
+    elapsed = time.perf_counter() - started_at
+    stats = {
+        "algorithm": "regional_balanced",
+        "nfe": nfe,
+        "wall_clock_seconds": elapsed,
+        "tokens_committed": total_committed,
+        "average_tokens_committed_per_forward": total_committed / nfe,
+        "region_size": region_size,
+        "region_count": len(states),
+        "local_steps": local_steps,
+        "max_progress_gap": max_progress_gap,
+        "deferral_threshold": deferral_threshold,
+        "deferral_until_revealed": deferral_until_revealed,
+        "deferral_events": deferral_events,
+        "gap_forced_events": gap_forced_events,
+        "blocked_region_events": blocked_region_events,
+        "tail_guard_iterations": tail_guard_iterations,
+    }
+    return x, stats
 
 
 class DreamGenerationConfig(GenerationConfig):
@@ -355,6 +568,23 @@ class DreamGenerationMixin:
             attention_mask=attention_mask 
         )
         threshold = kwargs.get("threshold", 0.9)
+        regional_options = {
+            "region_size": int(kwargs.get("regional_region_size", 32)),
+            "local_steps": int(kwargs.get("regional_local_steps", 32)),
+            "max_progress_gap": int(kwargs.get("regional_max_progress_gap", 4)),
+            "deferral_threshold": float(
+                kwargs.get("regional_deferral_threshold", 0.4)
+            ),
+            "deferral_until_revealed": int(
+                kwargs.get("regional_deferral_until_revealed", 2)
+            ),
+            "max_global_deferrals": int(
+                kwargs.get("regional_max_global_deferrals", 4)
+            ),
+            "tail_guard": bool(kwargs.get("regional_tail_guard", False)),
+            "commit_policy": str(kwargs.get("regional_commit_policy", "entropy")),
+            "extra_stop_token_ids": kwargs.get("regional_stop_token_ids", []),
+        }
 
         result = self._sample(
             input_ids,
@@ -362,7 +592,8 @@ class DreamGenerationMixin:
             generation_config=generation_config,
             generation_tokens_hook_func=generation_tokens_hook_func,
             generation_logits_hook_func=generation_logits_hook_func,
-            threshold=threshold
+            threshold=threshold,
+            regional_options=regional_options,
         )
         return result
 
@@ -373,7 +604,8 @@ class DreamGenerationMixin:
         generation_config: DreamGenerationConfig,
         generation_tokens_hook_func,
         generation_logits_hook_func,
-        threshold: Optional[float] = 0.9
+        threshold: Optional[float] = 0.9,
+        regional_options: Optional[Dict[str, Any]] = None,
     ) -> Union[DreamModelOutput, torch.LongTensor]:
         # init values
         output_history = generation_config.output_history
@@ -389,9 +621,12 @@ class DreamGenerationMixin:
         top_k = generation_config.top_k
 
         histories = [] if (return_dict_in_generate and output_history) else None
-        start_time = time.time()
         # pad input_ids to max_length
         x = F.pad(input_ids, (0, max_length - input_ids.shape[1]), value=mask_token_id)
+        initial_mask_tokens = int((x == mask_token_id).sum().item())
+        if x.device.type == "cuda":
+            torch.cuda.synchronize(x.device)
+        start_time = time.perf_counter()
 
         if attention_mask is not None and torch.any(attention_mask == 0.0):
             # we do not mask the [MASK] tokens so value = 1.0
@@ -412,6 +647,37 @@ class DreamGenerationMixin:
 
         # this allows user-defined token control of the intermediate steps
         x = generation_tokens_hook_func(None, x, None)
+        if alg == "regional_balanced":
+            regional_options = dict(regional_options or {})
+            eos_tensor = getattr(generation_config, "_eos_token_tensor", None)
+            eos_token_ids = (
+                [] if eos_tensor is None else eos_tensor.reshape(-1).tolist()
+            )
+            eos_token_ids.extend(regional_options.pop("extra_stop_token_ids", []))
+            x, stats = _regional_sample(
+                self,
+                x,
+                attention_mask=attention_mask,
+                tok_idx=tok_idx,
+                prompt_length=input_ids.shape[1],
+                mask_token_id=mask_token_id,
+                eos_token_ids=eos_token_ids,
+                eps=eps,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                alg_temp=alg_temp,
+                generation_tokens_hook_func=generation_tokens_hook_func,
+                generation_logits_hook_func=generation_logits_hook_func,
+                histories=histories,
+                started_at=start_time,
+                **regional_options,
+            )
+            print(f"used steps: {stats['nfe']}")
+            print(f"used time: {stats['wall_clock_seconds']}")
+            if return_dict_in_generate:
+                return DreamModelOutput(sequences=x, history=histories, stats=stats)
+            return x
         i = 0
         if alg == 'confidence_threshold':
             mask_index = (x == mask_token_id)
@@ -496,13 +762,23 @@ class DreamGenerationMixin:
                 histories.append(x.clone())
             i += 1
         
+        if x.device.type == "cuda":
+            torch.cuda.synchronize(x.device)
+        elapsed = time.perf_counter() - start_time
+        stats = {
+            "algorithm": alg,
+            "nfe": steps,
+            "wall_clock_seconds": elapsed,
+            "tokens_committed": initial_mask_tokens,
+            "average_tokens_committed_per_forward": initial_mask_tokens / steps,
+        }
         print(f'used steps: {steps}')
-        end_time = time.time()
-        print(f'used time: {end_time - start_time}')
+        print(f'used time: {elapsed}')
         if return_dict_in_generate:
             return DreamModelOutput(
                 sequences=x,
                 history=histories,
+                stats=stats,
             )
         else:
             return x

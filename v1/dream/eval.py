@@ -77,6 +77,14 @@ class Dream(LM):
         apply_chat_template: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         dual_cache: Optional[bool] = False,
+        regional_region_size: Optional[int] = 32,
+        regional_local_steps: Optional[int] = 32,
+        regional_max_progress_gap: Optional[int] = 4,
+        regional_deferral_threshold: Optional[float] = 0.4,
+        regional_deferral_until_revealed: Optional[int] = 2,
+        regional_max_global_deferrals: Optional[int] = 4,
+        regional_tail_guard: Optional[bool] = False,
+        regional_commit_policy: Optional[str] = "entropy",
         save_dir: Optional[str] = None,
         **kwargs,
     ) -> None:
@@ -209,7 +217,23 @@ class Dream(LM):
         self.if_apply_chat_template = apply_chat_template
         self.use_cache = use_cache
         self.dual_cache = dual_cache
+        self.regional_region_size = int(regional_region_size)
+        self.regional_local_steps = int(regional_local_steps)
+        self.regional_max_progress_gap = int(regional_max_progress_gap)
+        self.regional_deferral_threshold = float(regional_deferral_threshold)
+        self.regional_deferral_until_revealed = int(
+            regional_deferral_until_revealed
+        )
+        self.regional_max_global_deferrals = int(regional_max_global_deferrals)
+        self.regional_tail_guard = bool(regional_tail_guard)
+        self.regional_commit_policy = str(regional_commit_policy)
+        if self.alg == "regional_balanced" and self.use_cache:
+            raise ValueError(
+                "regional_balanced uses full-canvas updates and is not compatible "
+                "with Fast-dLLM's sequential prefix/dual cache path; set use_cache=false"
+            )
         self.generated_token_num = 0
+        self.generation_stats = []
         self.save_dir = save_dir
     @property
     def batch_size(self):
@@ -319,7 +343,33 @@ class Dream(LM):
             alg_temp=self.alg_temp,
             threshold=self.threshold,
             dual_cache=self.dual_cache,
+            regional_region_size=self.regional_region_size,
+            regional_local_steps=self.regional_local_steps,
+            regional_max_progress_gap=self.regional_max_progress_gap,
+            regional_deferral_threshold=self.regional_deferral_threshold,
+            regional_deferral_until_revealed=(
+                self.regional_deferral_until_revealed
+            ),
+            regional_max_global_deferrals=self.regional_max_global_deferrals,
+            regional_tail_guard=self.regional_tail_guard,
+            regional_commit_policy=self.regional_commit_policy,
+            regional_stop_token_ids=[
+                int(token_id)
+                for token_id in {
+                    self.tokenizer.eos_token_id,
+                    *(
+                        self.tokenizer.get_vocab().get(marker)
+                        for marker in ("<|eot_id|>", "<|im_end|>")
+                    ),
+                }
+                if token_id is not None
+            ],
         )
+
+        generation_stats = getattr(generation_ids, "stats", None)
+        if generation_stats is not None:
+            self.generation_stats.append(dict(generation_stats))
+            print("generation_stats: " + json.dumps(generation_stats, sort_keys=True))
 
         # decode
         self.generated_token_num += (generation_ids.sequences[0][prompt_ids.shape[1] :] != self.tokenizer.eos_token_id).sum().item()
@@ -395,6 +445,26 @@ class Dream(LM):
         print(f"Time taken: {end_time - start_time} seconds")
         print(f"Generated token num: {self.generated_token_num}")
         print(f"Generated token num per second: {self.generated_token_num / (end_time - start_time)}")
+        if self.generation_stats:
+            example_count = len(self.generation_stats)
+            mean_nfe = sum(item["nfe"] for item in self.generation_stats) / example_count
+            mean_seconds = (
+                sum(item["wall_clock_seconds"] for item in self.generation_stats)
+                / example_count
+            )
+            generation_summary = {
+                "algorithm": self.alg,
+                "examples": example_count,
+                "mean_nfe": mean_nfe,
+                "mean_wall_clock_seconds": mean_seconds,
+                "canvas_tokens_per_second": (
+                    self.max_new_tokens / mean_seconds if mean_seconds > 0 else None
+                ),
+            }
+            print(
+                "generation_summary: "
+                + json.dumps(generation_summary, sort_keys=True)
+            )
 
         return res
 
