@@ -23,6 +23,16 @@ For a 256-token response canvas and 32-token regions, the algorithm:
 7. optionally freezes the predicted terminal region while a region to its left
    remains unfinished (`regional_tail_guard=true`).
 
+Three termination variants are exposed for attribution:
+
+- `regional`: coarse predicted-terminal-region guard;
+- `regional_filter`: while earlier regions are unfinished, exclude stop-token
+  proposals and proposals below the stop confidence threshold from the
+  terminal region; once a stop is accepted, ignore its masked suffix;
+- `regional_defer`: defer the terminal region's entire scheduled update when
+  that update contains a stop proposal. This is retained as a negative
+  ablation, not the recommended operating point.
+
 The released Fast-dLLM confidence-threshold algorithm is not modified and is
 the direct control. The regional path intentionally rejects `use_cache=true`:
 Fast-dLLM's prefix/dual cache assumes a sequential active block, whereas this
@@ -58,6 +68,8 @@ LIMIT=50 bash scripts/run_gsm8k_regional.sh vanilla
 LIMIT=50 bash scripts/run_gsm8k_regional.sh fast
 LIMIT=50 bash scripts/run_gsm8k_regional.sh fast_cache
 LIMIT=50 bash scripts/run_gsm8k_regional.sh regional
+LIMIT=50 bash scripts/run_gsm8k_regional.sh regional_filter
+LIMIT=50 bash scripts/run_gsm8k_regional.sh regional_defer
 ```
 
 `fast` isolates Fast-dLLM's global confidence selector without caching.

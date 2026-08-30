@@ -47,6 +47,19 @@ class RegionalSchedulerTest(unittest.TestCase):
         self.assertEqual(blocked, {1})
         self.assertEqual(urgent, {0})
 
+    def test_stalled_stop_child_temporarily_exempts_parent_gap(self):
+        regions = build_regions(16, 8)
+        active, blocked, urgent = controlled_regions(
+            regions,
+            remaining_masks=[4, 8],
+            local_steps=8,
+            max_progress_gap=4,
+            progress_gap_exempt_children={1},
+        )
+        self.assertEqual(active, [0, 1])
+        self.assertEqual(blocked, set())
+        self.assertEqual(urgent, set())
+
     def test_zero_quota_does_not_imply_revealed_progress(self):
         regions = build_regions(32, 32)
         count = linear_transfer_count(

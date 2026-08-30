@@ -84,6 +84,8 @@ class Dream(LM):
         regional_deferral_until_revealed: Optional[int] = 2,
         regional_max_global_deferrals: Optional[int] = 4,
         regional_tail_guard: Optional[bool] = False,
+        regional_stop_mode: Optional[str] = None,
+        regional_stop_filter_threshold: Optional[float] = 0.7,
         regional_commit_policy: Optional[str] = "entropy",
         save_dir: Optional[str] = None,
         **kwargs,
@@ -226,6 +228,10 @@ class Dream(LM):
         )
         self.regional_max_global_deferrals = int(regional_max_global_deferrals)
         self.regional_tail_guard = bool(regional_tail_guard)
+        self.regional_stop_mode = regional_stop_mode
+        self.regional_stop_filter_threshold = float(
+            regional_stop_filter_threshold
+        )
         self.regional_commit_policy = str(regional_commit_policy)
         if self.alg == "regional_balanced" and self.use_cache:
             raise ValueError(
@@ -352,6 +358,8 @@ class Dream(LM):
             ),
             regional_max_global_deferrals=self.regional_max_global_deferrals,
             regional_tail_guard=self.regional_tail_guard,
+            regional_stop_mode=self.regional_stop_mode,
+            regional_stop_filter_threshold=self.regional_stop_filter_threshold,
             regional_commit_policy=self.regional_commit_policy,
             regional_stop_token_ids=[
                 int(token_id)

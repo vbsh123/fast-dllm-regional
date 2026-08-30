@@ -20,8 +20,14 @@ case "$METHOD" in
   regional)
     MODEL_ARGS="pretrained=${MODEL},max_new_tokens=${LENGTH},diffusion_steps=${LENGTH},add_bos_token=true,alg=regional_balanced,use_cache=false,regional_region_size=32,regional_local_steps=32,regional_max_progress_gap=4,regional_deferral_threshold=0.4,regional_deferral_until_revealed=2,regional_max_global_deferrals=4,regional_tail_guard=true,regional_commit_policy=entropy"
     ;;
+  regional_filter)
+    MODEL_ARGS="pretrained=${MODEL},max_new_tokens=${LENGTH},diffusion_steps=${LENGTH},add_bos_token=true,alg=regional_balanced,use_cache=false,regional_region_size=32,regional_local_steps=32,regional_max_progress_gap=4,regional_deferral_threshold=0.4,regional_deferral_until_revealed=2,regional_max_global_deferrals=4,regional_stop_mode=filter,regional_stop_filter_threshold=0.7,regional_commit_policy=entropy"
+    ;;
+  regional_defer)
+    MODEL_ARGS="pretrained=${MODEL},max_new_tokens=${LENGTH},diffusion_steps=${LENGTH},add_bos_token=true,alg=regional_balanced,use_cache=false,regional_region_size=32,regional_local_steps=32,regional_max_progress_gap=4,regional_deferral_threshold=0.4,regional_deferral_until_revealed=2,regional_max_global_deferrals=4,regional_stop_mode=defer,regional_stop_filter_threshold=0.7,regional_commit_policy=entropy"
+    ;;
   *)
-    echo "usage: $0 {vanilla|fast|fast_cache|regional}" >&2
+    echo "usage: $0 {vanilla|fast|fast_cache|regional|regional_filter|regional_defer}" >&2
     exit 2
     ;;
 esac

@@ -128,7 +128,8 @@ def _regional_sample(
     deferral_threshold,
     deferral_until_revealed,
     max_global_deferrals,
-    tail_guard,
+    stop_mode,
+    stop_filter_threshold,
     generation_tokens_hook_func,
     generation_logits_hook_func,
     histories,
@@ -151,6 +152,12 @@ def _regional_sample(
         raise ValueError(
             "regional_commit_policy must be maskgit_plus, topk_margin, or entropy"
         )
+    if stop_mode not in {"none", "tail_guard", "filter", "defer"}:
+        raise ValueError(
+            "regional_stop_mode must be none, tail_guard, filter, or defer"
+        )
+    if not 0.0 <= stop_filter_threshold <= 1.0:
+        raise ValueError("regional_stop_filter_threshold must be in [0, 1]")
 
     eos_token_ids = {int(token) for token in eos_token_ids}
     global_empty_deferral_streak = 0
@@ -160,12 +167,23 @@ def _regional_sample(
     gap_forced_events = 0
     tail_guard_iterations = 0
     blocked_region_events = 0
+    stop_protection_events = 0
+    stop_schedule_hold_events = 0
+    stop_low_confidence_candidate_events = 0
+    stop_stalled_regions: set[int] = set()
+    accepted_stop_position = None
     max_iterations = local_steps * (len(states) + 2) * (max_global_deferrals + 1)
 
-    while bool((x[:, prompt_length:] == mask_token_id).any()):
+    while True:
         response_mask = x[0, prompt_length:] == mask_token_id
+        effective_response_mask = response_mask.clone()
+        if accepted_stop_position is not None:
+            effective_response_mask[accepted_stop_position:] = False
+        if not bool(effective_response_mask.any()):
+            break
         remaining = [
-            int(response_mask[state.start:state.end].sum().item()) for state in states
+            int(effective_response_mask[state.start:state.end].sum().item())
+            for state in states
         ]
         logits = model(x, attention_mask, tok_idx).logits
         logits = torch.cat([logits[:, :1], logits[:, :-1]], dim=1)
@@ -187,18 +205,30 @@ def _regional_sample(
         full_confidence[absolute_mask] = confidence.to(logits.dtype)
         full_predictions = x.clone()
         full_predictions[absolute_mask] = predictions
-        raw_top1_probability = mask_logits.float().softmax(dim=-1).max(dim=-1).values
+        raw_probabilities = mask_logits.float().softmax(dim=-1)
+        raw_top1_probability, raw_top1_predictions = raw_probabilities.max(dim=-1)
         full_top1_probability = torch.zeros_like(x, dtype=torch.float32)
         full_top1_probability[absolute_mask] = raw_top1_probability
+        raw_proposed_probability = raw_probabilities.gather(
+            -1, predictions.unsqueeze(-1)
+        ).squeeze(-1)
+        full_proposed_probability = torch.zeros_like(x, dtype=torch.float32)
+        full_proposed_probability[absolute_mask] = raw_proposed_probability
+        full_raw_top1_predictions = x.clone()
+        full_raw_top1_predictions[absolute_mask] = raw_top1_predictions
 
         guarded_tail = None
-        if tail_guard and eos_token_ids:
+        if (
+            stop_mode != "none"
+            and accepted_stop_position is None
+            and eos_token_ids
+        ):
             response_predictions = logits[0, prompt_length:].argmax(dim=-1)
             predicted_stop = torch.zeros_like(response_predictions, dtype=torch.bool)
             for token_id in eos_token_ids:
                 predicted_stop |= response_predictions == token_id
             stop_candidates = torch.nonzero(
-                response_mask & predicted_stop, as_tuple=False
+                effective_response_mask & predicted_stop, as_tuple=False
             )
             if stop_candidates.numel() > 0:
                 stop_position = int(stop_candidates[0, 0].item())
@@ -211,12 +241,32 @@ def _regional_sample(
                     guarded_tail = candidate_tail
                     tail_guard_iterations += 1
 
+        max_region_exclusive = None
+        if guarded_tail is not None:
+            max_region_exclusive = (
+                guarded_tail
+                if stop_mode == "tail_guard"
+                else guarded_tail + 1
+            )
+        if accepted_stop_position is not None:
+            endpoint_exclusive = next(
+                state.index + 1
+                for state in states
+                if state.start <= accepted_stop_position < state.end
+            )
+            max_region_exclusive = (
+                endpoint_exclusive
+                if max_region_exclusive is None
+                else min(max_region_exclusive, endpoint_exclusive)
+            )
+
         active, blocked, urgent = controlled_regions(
             states,
             remaining_masks=remaining,
             local_steps=local_steps,
             max_progress_gap=max_progress_gap,
-            max_region_exclusive=guarded_tail,
+            max_region_exclusive=max_region_exclusive,
+            progress_gap_exempt_children=set(stop_stalled_regions),
         )
         blocked_region_events += len(blocked)
         if not active:
@@ -233,13 +283,17 @@ def _regional_sample(
             forced_reasons[active[0]] = "global_deadlock"
 
         deferred: set[int] = set()
+        schedule_held: set[int] = set()
+        committed_stop_positions: list[int] = []
         committed_this_forward = 0
         for index in active:
             state = states[index]
             relative_positions = torch.arange(
                 state.start, state.end, device=x.device, dtype=torch.long
             )
-            relative_positions = relative_positions[response_mask[relative_positions]]
+            relative_positions = relative_positions[
+                effective_response_mask[relative_positions]
+            ]
             count = linear_transfer_count(
                 int(relative_positions.numel()),
                 schedule_step=state.schedule_step,
@@ -253,12 +307,74 @@ def _regional_sample(
             count = min(count, int(relative_positions.numel()))
             absolute_positions = relative_positions + prompt_length
             scores = full_confidence[0, absolute_positions]
+            candidate_predictions = full_predictions[0, absolute_positions]
+            raw_candidate_predictions = full_raw_top1_predictions[
+                0, absolute_positions
+            ]
+            protected = (
+                stop_mode in {"filter", "defer"}
+                and guarded_tail is not None
+                and index == guarded_tail
+            )
+            stop_candidates = torch.zeros_like(
+                candidate_predictions, dtype=torch.bool
+            )
+            if protected:
+                for token_id in eos_token_ids:
+                    stop_candidates |= candidate_predictions == token_id
+                    if stop_mode == "defer":
+                        stop_candidates |= raw_candidate_predictions == token_id
+
+            selection_pool = torch.arange(
+                relative_positions.numel(), device=x.device
+            )
+            if protected and stop_mode == "filter":
+                low_confidence = (
+                    full_proposed_probability[0, absolute_positions]
+                    < stop_filter_threshold
+                )
+                stop_low_confidence_candidate_events += int(
+                    low_confidence.sum().item()
+                )
+                selection_pool = selection_pool[
+                    ~stop_candidates & ~low_confidence
+                ]
+
+            selected_count = min(count, int(selection_pool.numel()))
+            if selected_count == 0:
+                if protected:
+                    schedule_held.add(index)
+                    stop_protection_events += 1
+                    stop_schedule_hold_events += 1
+                continue
+            pool_scores = scores[selection_pool]
             if alg_temp is None or alg_temp == 0:
-                chosen = torch.topk(scores, k=count).indices
+                chosen_in_pool = torch.topk(
+                    pool_scores, k=selected_count
+                ).indices
             else:
-                weights = F.softmax(scores / alg_temp, dim=-1)
-                chosen = torch.multinomial(weights, num_samples=count)
-            selected_absolute = absolute_positions[chosen]
+                weights = F.softmax(pool_scores / alg_temp, dim=-1)
+                chosen_in_pool = torch.multinomial(
+                    weights, num_samples=selected_count
+                )
+            chosen = selection_pool[chosen_in_pool]
+
+            if (
+                protected
+                and stop_mode == "defer"
+                and bool(stop_candidates[chosen].any().item())
+            ):
+                schedule_held.add(index)
+                stop_protection_events += 1
+                stop_schedule_hold_events += 1
+                continue
+            if protected and stop_mode == "filter" and selected_count < count:
+                schedule_held.add(index)
+                stop_protection_events += 1
+                stop_schedule_hold_events += 1
+
+            selected_relative = relative_positions[chosen]
+            selected_absolute = selected_relative + prompt_length
             minimum_probability = float(
                 full_top1_probability[0, selected_absolute].min().item()
             )
@@ -273,8 +389,21 @@ def _regional_sample(
                 gap_forced_events += 1
             state.deferrals = 0
             x[0, selected_absolute] = full_predictions[0, selected_absolute]
-            state.schedule_step += 1
+            if index not in schedule_held:
+                state.schedule_step += 1
             committed_this_forward += int(selected_absolute.numel())
+            for position in selected_relative.tolist():
+                if int(x[0, prompt_length + position].item()) in eos_token_ids:
+                    committed_stop_positions.append(int(position))
+
+        stop_stalled_regions = set(schedule_held)
+        if committed_stop_positions and stop_mode in {"filter", "defer"}:
+            earliest_stop = min(committed_stop_positions)
+            if (
+                accepted_stop_position is None
+                or earliest_stop < accepted_stop_position
+            ):
+                accepted_stop_position = earliest_stop
 
         total_committed += committed_this_forward
         if committed_this_forward == 0 and deferred:
@@ -309,6 +438,19 @@ def _regional_sample(
         "gap_forced_events": gap_forced_events,
         "blocked_region_events": blocked_region_events,
         "tail_guard_iterations": tail_guard_iterations,
+        "stop_mode": stop_mode,
+        "stop_filter_threshold": stop_filter_threshold,
+        "stop_protection_events": stop_protection_events,
+        "stop_schedule_hold_events": stop_schedule_hold_events,
+        "stop_low_confidence_candidate_events": (
+            stop_low_confidence_candidate_events
+        ),
+        "accepted_stop_position": accepted_stop_position,
+        "ignored_suffix_tokens": (
+            0
+            if accepted_stop_position is None
+            else generation_length - accepted_stop_position - 1
+        ),
     }
     return x, stats
 
@@ -568,6 +710,13 @@ class DreamGenerationMixin:
             attention_mask=attention_mask 
         )
         threshold = kwargs.get("threshold", 0.9)
+        regional_stop_mode = kwargs.get("regional_stop_mode")
+        if regional_stop_mode is None:
+            regional_stop_mode = (
+                "tail_guard"
+                if bool(kwargs.get("regional_tail_guard", False))
+                else "none"
+            )
         regional_options = {
             "region_size": int(kwargs.get("regional_region_size", 32)),
             "local_steps": int(kwargs.get("regional_local_steps", 32)),
@@ -581,7 +730,10 @@ class DreamGenerationMixin:
             "max_global_deferrals": int(
                 kwargs.get("regional_max_global_deferrals", 4)
             ),
-            "tail_guard": bool(kwargs.get("regional_tail_guard", False)),
+            "stop_mode": str(regional_stop_mode),
+            "stop_filter_threshold": float(
+                kwargs.get("regional_stop_filter_threshold", 0.7)
+            ),
             "commit_policy": str(kwargs.get("regional_commit_policy", "entropy")),
             "extra_stop_token_ids": kwargs.get("regional_stop_token_ids", []),
         }

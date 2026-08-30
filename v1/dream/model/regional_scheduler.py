@@ -64,6 +64,7 @@ def controlled_regions(
     local_steps: int,
     max_progress_gap: int,
     max_region_exclusive: int | None = None,
+    progress_gap_exempt_children: set[int] | None = None,
 ) -> tuple[list[int], set[int], set[int]]:
     """Return active, blocked, and urgency-forced region indices.
 
@@ -97,7 +98,10 @@ def controlled_regions(
         if child_progress > parent_progress:
             blocked.add(child_index)
             urgent.add(parent_index)
-        elif parent_progress - child_progress >= max(1, max_progress_gap):
+        elif (
+            parent_progress - child_progress >= max(1, max_progress_gap)
+            and child_index not in (progress_gap_exempt_children or set())
+        ):
             blocked.add(parent_index)
             urgent.add(child_index)
 
