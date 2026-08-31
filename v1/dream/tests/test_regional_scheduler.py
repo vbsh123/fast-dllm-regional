@@ -12,6 +12,7 @@ from regional_scheduler import (  # noqa: E402
     build_regions,
     controlled_regions,
     linear_transfer_count,
+    startup_force_reason,
 )
 
 
@@ -74,6 +75,40 @@ class RegionalSchedulerTest(unittest.TestCase):
                 11, schedule_step=31, local_steps=32, eps=1e-3
             ),
             11,
+        )
+
+    def test_region_is_forced_after_four_consecutive_deferrals(self):
+        region = build_regions(32, 32)[0]
+        region.deferrals = 3
+        self.assertIsNone(
+            startup_force_reason(
+                region,
+                remaining_masks=32,
+                deferral_until_revealed=2,
+                max_region_deferrals=4,
+            )
+        )
+        region.deferrals = 4
+        self.assertEqual(
+            startup_force_reason(
+                region,
+                remaining_masks=32,
+                deferral_until_revealed=2,
+                max_region_deferrals=4,
+            ),
+            "region_deferral_limit",
+        )
+
+    def test_confidence_gate_closes_after_two_reveals(self):
+        region = build_regions(32, 32)[0]
+        self.assertEqual(
+            startup_force_reason(
+                region,
+                remaining_masks=30,
+                deferral_until_revealed=2,
+                max_region_deferrals=4,
+            ),
+            "deferral_window_closed",
         )
 
 

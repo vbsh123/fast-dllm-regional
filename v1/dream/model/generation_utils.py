@@ -39,6 +39,7 @@ from .regional_scheduler import (
     build_regions,
     controlled_regions,
     linear_transfer_count,
+    startup_force_reason,
 )
 
 logger = logging.get_logger(__name__)
@@ -173,6 +174,7 @@ def _regional_sample(
     max_progress_gap,
     deferral_threshold,
     deferral_until_revealed,
+    max_region_deferrals,
     max_global_deferrals,
     stop_mode,
     stop_filter_threshold,
@@ -192,6 +194,8 @@ def _regional_sample(
         raise ValueError("regional_deferral_threshold must be in [0, 1]")
     if deferral_until_revealed < 0:
         raise ValueError("regional_deferral_until_revealed must be non-negative")
+    if max_region_deferrals < 0:
+        raise ValueError("regional_max_region_deferrals must be non-negative")
     if max_global_deferrals <= 0:
         raise ValueError("regional_max_global_deferrals must be positive")
     if commit_policy not in {"maskgit_plus", "topk_margin", "entropy"}:
@@ -223,6 +227,7 @@ def _regional_sample(
     startup_deferred_update_events = 0
     startup_confidence_pass_commit_events = 0
     startup_gap_forced_commit_events = 0
+    startup_region_limit_forced_commit_events = 0
     startup_global_deadlock_forced_commit_events = 0
     startup_committed_update_events = 0
     startup_bootstrap_tokens_committed = 0
@@ -239,6 +244,7 @@ def _regional_sample(
     startup_deferred_min_probabilities = []
     startup_confidence_pass_min_probabilities = []
     startup_gap_forced_min_probabilities = []
+    startup_region_limit_forced_min_probabilities = []
     startup_global_forced_min_probabilities = []
     startup_committed_probability_sum = 0.0
     startup_committed_probability_count = 0
@@ -264,6 +270,7 @@ def _regional_sample(
                 "deferred_update_events": 0,
                 "confidence_pass_commit_events": 0,
                 "gap_forced_commit_events": 0,
+                "region_limit_forced_commit_events": 0,
                 "global_deadlock_forced_commit_events": 0,
                 "committed_update_events": 0,
                 "bootstrap_tokens_committed": 0,
@@ -389,8 +396,14 @@ def _regional_sample(
 
         forced_reasons = {index: "gap" for index in urgent}
         for index in active:
-            if states[index].size - remaining[index] >= deferral_until_revealed:
-                forced_reasons.setdefault(index, "deferral_window_closed")
+            local_force_reason = startup_force_reason(
+                states[index],
+                remaining_masks=remaining[index],
+                deferral_until_revealed=deferral_until_revealed,
+                max_region_deferrals=max_region_deferrals,
+            )
+            if local_force_reason is not None:
+                forced_reasons.setdefault(index, local_force_reason)
         if global_empty_deferral_streak >= max_global_deferrals and not forced_reasons:
             forced_reasons[active[0]] = "global_deadlock"
 
@@ -557,6 +570,17 @@ def _regional_sample(
 
             if minimum_probability < deferral_threshold and force_reason == "gap":
                 gap_forced_events += 1
+            if (
+                minimum_probability < deferral_threshold
+                and force_reason == "region_deferral_limit"
+            ):
+                startup_region_limit_forced_commit_events += 1
+                per_region_startup[index][
+                    "region_limit_forced_commit_events"
+                ] += 1
+                startup_region_limit_forced_min_probabilities.append(
+                    minimum_probability
+                )
             if minimum_probability < deferral_threshold and force_reason == "global_deadlock":
                 global_deadlock_forced_events += 1
 
@@ -580,6 +604,8 @@ def _regional_sample(
                     startup_gap_forced_min_probabilities.append(
                         minimum_probability
                     )
+                elif force_reason == "region_deferral_limit":
+                    commit_reason = "region_deferral_limit_forced_low_confidence"
                 elif force_reason == "global_deadlock":
                     commit_reason = "global_deadlock_forced_low_confidence"
                     startup_global_deadlock_forced_commit_events += 1
@@ -687,8 +713,22 @@ def _regional_sample(
     elapsed = time.perf_counter() - started_at
     startup_forced_commit_events = (
         startup_gap_forced_commit_events
+        + startup_region_limit_forced_commit_events
         + startup_global_deadlock_forced_commit_events
     )
+    maximum_startup_deferral_events = (
+        sum(
+            int(region["startup_target_tokens"])
+            for region in per_region_startup
+        )
+        * max_region_deferrals
+    )
+    if startup_deferred_update_events > maximum_startup_deferral_events:
+        raise RuntimeError(
+            "regional startup deferrals exceeded the configured per-region "
+            f"bound: observed={startup_deferred_update_events}, "
+            f"maximum={maximum_startup_deferral_events}"
+        )
     startup_decision_events = (
         startup_deferred_update_events + startup_committed_update_events
     )
@@ -699,9 +739,13 @@ def _regional_sample(
         "candidate_update_events": startup_candidate_update_events,
         "decision_events": startup_decision_events,
         "deferred_update_events": startup_deferred_update_events,
+        "maximum_deferral_events": maximum_startup_deferral_events,
         "confidence_pass_commit_events": startup_confidence_pass_commit_events,
         "gap_forced_low_confidence_commit_events": (
             startup_gap_forced_commit_events
+        ),
+        "region_limit_forced_low_confidence_commit_events": (
+            startup_region_limit_forced_commit_events
         ),
         "global_deadlock_forced_low_confidence_commit_events": (
             startup_global_deadlock_forced_commit_events
@@ -730,6 +774,9 @@ def _regional_sample(
         ),
         "gap_forced_min_top1_probability": _number_summary(
             startup_gap_forced_min_probabilities
+        ),
+        "region_limit_forced_min_top1_probability": _number_summary(
+            startup_region_limit_forced_min_probabilities
         ),
         "global_forced_min_top1_probability": _number_summary(
             startup_global_forced_min_probabilities
@@ -782,6 +829,7 @@ def _regional_sample(
         "max_progress_gap": max_progress_gap,
         "deferral_threshold": deferral_threshold,
         "deferral_until_revealed": deferral_until_revealed,
+        "max_region_deferrals": max_region_deferrals,
         "deferral_events": deferral_events,
         "gap_forced_events": gap_forced_events,
         "global_deadlock_forced_events": global_deadlock_forced_events,
@@ -1096,6 +1144,9 @@ class DreamGenerationMixin:
             ),
             "max_global_deferrals": int(
                 kwargs.get("regional_max_global_deferrals", 4)
+            ),
+            "max_region_deferrals": int(
+                kwargs.get("regional_max_region_deferrals", 4)
             ),
             "stop_mode": str(regional_stop_mode),
             "stop_filter_threshold": float(

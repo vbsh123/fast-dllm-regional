@@ -57,6 +57,26 @@ def linear_transfer_count(
     return int(remaining_masks * (1.0 - next_time / current_time))
 
 
+def startup_force_reason(
+    state: RegionState,
+    *,
+    remaining_masks: int,
+    deferral_until_revealed: int,
+    max_region_deferrals: int,
+) -> str | None:
+    """Return the region-local reason that bypasses startup deferral."""
+    if deferral_until_revealed < 0:
+        raise ValueError("deferral_until_revealed must be non-negative")
+    if max_region_deferrals < 0:
+        raise ValueError("max_region_deferrals must be non-negative")
+    revealed = state.size - remaining_masks
+    if revealed >= deferral_until_revealed:
+        return "deferral_window_closed"
+    if state.deferrals >= max_region_deferrals:
+        return "region_deferral_limit"
+    return None
+
+
 def controlled_regions(
     states: list[RegionState],
     *,

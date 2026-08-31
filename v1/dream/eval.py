@@ -82,6 +82,7 @@ class Dream(LM):
         regional_max_progress_gap: Optional[int] = 4,
         regional_deferral_threshold: Optional[float] = 0.4,
         regional_deferral_until_revealed: Optional[int] = 2,
+        regional_max_region_deferrals: Optional[int] = 4,
         regional_max_global_deferrals: Optional[int] = 4,
         regional_tail_guard: Optional[bool] = False,
         regional_stop_mode: Optional[str] = None,
@@ -226,6 +227,9 @@ class Dream(LM):
         self.regional_deferral_until_revealed = int(
             regional_deferral_until_revealed
         )
+        self.regional_max_region_deferrals = int(
+            regional_max_region_deferrals
+        )
         self.regional_max_global_deferrals = int(regional_max_global_deferrals)
         self.regional_tail_guard = bool(regional_tail_guard)
         self.regional_stop_mode = regional_stop_mode
@@ -355,6 +359,9 @@ class Dream(LM):
             regional_deferral_threshold=self.regional_deferral_threshold,
             regional_deferral_until_revealed=(
                 self.regional_deferral_until_revealed
+            ),
+            regional_max_region_deferrals=(
+                self.regional_max_region_deferrals
             ),
             regional_max_global_deferrals=self.regional_max_global_deferrals,
             regional_tail_guard=self.regional_tail_guard,
@@ -501,7 +508,15 @@ class Dream(LM):
                     startup,
                     "global_deadlock_forced_low_confidence_commit_events",
                 )
-                forced_events = gap_forced_events + global_forced_events
+                region_limit_forced_events = total(
+                    startup,
+                    "region_limit_forced_low_confidence_commit_events",
+                )
+                forced_events = (
+                    gap_forced_events
+                    + region_limit_forced_events
+                    + global_forced_events
+                )
                 total_nfe = sum(int(item["nfe"]) for item in regional_stats)
                 committing_region_events = total(
                     concurrency, "committing_region_events"
@@ -546,6 +561,7 @@ class Dream(LM):
                         item["max_progress_gap"],
                         item["deferral_threshold"],
                         item["deferral_until_revealed"],
+                        item["max_region_deferrals"],
                         item["stop_mode"],
                     )
                     for item in regional_stats
@@ -558,17 +574,24 @@ class Dream(LM):
                             "max_progress_gap": config[2],
                             "deferral_threshold": config[3],
                             "deferral_until_revealed": config[4],
-                            "stop_mode": config[5],
+                            "max_region_deferrals": config[5],
+                            "stop_mode": config[6],
                         }
                         for config in sorted(configurations, key=str)
                     ],
                     "startup_candidate_update_events": candidate_events,
                     "startup_deferred_update_events": deferred_events,
+                    "startup_maximum_deferral_events": total(
+                        startup, "maximum_deferral_events"
+                    ),
                     "startup_confidence_pass_commit_events": total(
                         startup, "confidence_pass_commit_events"
                     ),
                     "startup_gap_forced_low_confidence_commit_events": (
                         gap_forced_events
+                    ),
+                    "startup_region_limit_forced_low_confidence_commit_events": (
+                        region_limit_forced_events
                     ),
                     "startup_global_forced_low_confidence_commit_events": (
                         global_forced_events

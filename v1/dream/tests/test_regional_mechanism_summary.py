@@ -20,13 +20,16 @@ class RegionalMechanismSummaryTest(unittest.TestCase):
             "max_progress_gap": 4,
             "deferral_threshold": 0.4,
             "deferral_until_revealed": 2,
+            "max_region_deferrals": 4,
             "stop_mode": "filter",
             "startup_mechanism": {
                 "candidate_update_events": 8,
                 "deferred_update_events": 4,
+                "maximum_deferral_events": 8,
                 "committed_update_events": 4,
                 "confidence_pass_commit_events": 2,
                 "gap_forced_low_confidence_commit_events": 1,
+                "region_limit_forced_low_confidence_commit_events": 0,
                 "global_deadlock_forced_low_confidence_commit_events": 1,
                 "bootstrap_tokens_committed": 4,
                 "per_region": [
@@ -36,6 +39,7 @@ class RegionalMechanismSummaryTest(unittest.TestCase):
                         "deferred_update_events": 4,
                         "confidence_pass_commit_events": 2,
                         "gap_forced_commit_events": 1,
+                        "region_limit_forced_commit_events": 0,
                         "global_deadlock_forced_commit_events": 1,
                         "bootstrap_tokens_committed": 4,
                         "first_commit_nfe": 2,
@@ -67,6 +71,7 @@ class RegionalMechanismSummaryTest(unittest.TestCase):
 
         self.assertEqual(result["examples"], 1)
         self.assertEqual(result["startup"]["deferral_rate"], 0.5)
+        self.assertEqual(result["startup"]["maximum_deferral_events"], 8)
         self.assertEqual(
             result["startup"]["forced_rate_per_committed_update"], 0.5
         )

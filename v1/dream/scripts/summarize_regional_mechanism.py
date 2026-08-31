@@ -51,6 +51,9 @@ def summarize(rows: list[dict]) -> dict:
     deferred_events = total(startup, "deferred_update_events")
     committed_events = total(startup, "committed_update_events")
     gap_forced = total(startup, "gap_forced_low_confidence_commit_events")
+    region_limit_forced = total(
+        startup, "region_limit_forced_low_confidence_commit_events"
+    )
     global_forced = total(
         startup, "global_deadlock_forced_low_confidence_commit_events"
     )
@@ -83,6 +86,7 @@ def summarize(rows: list[dict]) -> dict:
             "deferred_update_events": 0,
             "confidence_pass_commit_events": 0,
             "gap_forced_commit_events": 0,
+            "region_limit_forced_commit_events": 0,
             "global_deadlock_forced_commit_events": 0,
             "bootstrap_tokens_committed": 0,
             "first_commit_nfes": [],
@@ -98,10 +102,11 @@ def summarize(rows: list[dict]) -> dict:
                 "deferred_update_events",
                 "confidence_pass_commit_events",
                 "gap_forced_commit_events",
+                "region_limit_forced_commit_events",
                 "global_deadlock_forced_commit_events",
                 "bootstrap_tokens_committed",
             ):
-                aggregate[key] += int(region[key])
+                aggregate[key] += int(region.get(key, 0))
             if region["first_commit_nfe"] is not None:
                 aggregate["first_commit_nfes"].append(region["first_commit_nfe"])
             if region["startup_complete_nfe"] is not None:
@@ -123,6 +128,9 @@ def summarize(rows: list[dict]) -> dict:
                 ),
                 "mean_gap_forced_commits": (
                     item["gap_forced_commit_events"] / examples
+                ),
+                "mean_region_limit_forced_commits": (
+                    item["region_limit_forced_commit_events"] / examples
                 ),
                 "mean_global_forced_commits": (
                     item["global_deadlock_forced_commit_events"] / examples
@@ -150,6 +158,7 @@ def summarize(rows: list[dict]) -> dict:
                 row["max_progress_gap"],
                 row["deferral_threshold"],
                 row["deferral_until_revealed"],
+                row.get("max_region_deferrals"),
                 row["stop_mode"],
             )
             for row in rows
@@ -165,7 +174,8 @@ def summarize(rows: list[dict]) -> dict:
                 "max_progress_gap": item[2],
                 "deferral_threshold": item[3],
                 "deferral_until_revealed": item[4],
-                "stop_mode": item[5],
+                "max_region_deferrals": item[5],
+                "stop_mode": item[6],
             }
             for item in configurations
         ],
@@ -173,17 +183,24 @@ def summarize(rows: list[dict]) -> dict:
         "startup": {
             "candidate_update_events": candidate_events,
             "deferred_update_events": deferred_events,
+            "maximum_deferral_events": total(
+                startup, "maximum_deferral_events"
+            ),
             "confidence_pass_commit_events": total(
                 startup, "confidence_pass_commit_events"
             ),
             "gap_forced_low_confidence_commit_events": gap_forced,
+            "region_limit_forced_low_confidence_commit_events": (
+                region_limit_forced
+            ),
             "global_forced_low_confidence_commit_events": global_forced,
             "bootstrap_tokens_committed": total(
                 startup, "bootstrap_tokens_committed"
             ),
             "deferral_rate": safe_ratio(deferred_events, candidate_events),
             "forced_rate_per_committed_update": safe_ratio(
-                gap_forced + global_forced, committed_events
+                gap_forced + region_limit_forced + global_forced,
+                committed_events,
             ),
             "mean_first_commit_nfe": (
                 sum(first_commit_nfes) / len(first_commit_nfes)

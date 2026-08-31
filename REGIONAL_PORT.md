@@ -19,7 +19,8 @@ For a 256-token response canvas and 32-token regions, the algorithm:
 5. prevents a child from leading its left neighbor and prevents a parent from
    leading its child by the configured token gap;
 6. permits low-confidence deferral only for the first configured reveals in a
-   region, unless backpressure or the global deadlock limit forces progress;
+   region, with a per-region consecutive-deferral cap; backpressure or the
+   global deadlock limit may force progress sooner;
 7. optionally freezes the predicted terminal region while a region to its left
    remains unfinished (`regional_tail_guard=true`).
 
@@ -65,8 +66,9 @@ python scripts/summarize_regional_mechanism.py logs/regional_filter_50.log
 ```
 
 The run script's documented leading defaults are 32-token regions, 32 local
-steps, a four-token maximum progress gap, a `0.4` startup threshold, and a
-two-token bootstrap window. They can be overridden without editing code. Use
+steps, a four-token maximum progress gap, a `0.4` startup threshold, a
+two-token bootstrap window, and at most four consecutive deferrals per region
+before that region is forced. They can be overridden without editing code. Use
 `RUN_TAG` whenever changing settings so lm-eval output directories do not
 collide:
 
@@ -76,6 +78,7 @@ LOCAL_STEPS=32 \
 MAX_PROGRESS_GAP=8 \
 DEFERRAL_THRESHOLD=0.4 \
 DEFERRAL_UNTIL_REVEALED=4 \
+MAX_REGION_DEFERRALS=4 \
 RUN_TAG=r40_d4_g8 \
 LIMIT=50 \
 bash scripts/run_gsm8k_regional.sh regional_filter
@@ -134,6 +137,18 @@ LIMIT=50 bash scripts/run_gsm8k_regional.sh regional_defer
 `fast_cache` is the released dual-cache plus parallel path. The latter is an
 important end-to-end comparison, but it is not a selector-only attribution
 because the regional algorithm cannot safely reuse that sequential-block cache.
+
+For a matched HumanEval comparison, the wrapper switches to zero-shot
+HumanEval, enables code-evaluation confirmation and `escape_until`, and keeps
+the model/decoder settings otherwise identical:
+
+```bash
+LIMIT=20 bash scripts/run_humaneval_regional.sh fast
+LIMIT=20 bash scripts/run_humaneval_regional.sh regional_filter
+```
+
+HumanEval execution scoring still uses the repository's upstream
+`postprocess_code.py` on each generated `samples_humaneval_*.jsonl` file.
 
 This protocol uses Dream-v0-Base-7B and GSM8K 5-shot, matching Fast-dLLM's
 released Dream guide. The non-cache paths print `generation_stats` per example
