@@ -44,6 +44,52 @@ from .regional_scheduler import (
 logger = logging.get_logger(__name__)
 
 
+def _number_summary(values):
+    """Return a compact JSON-serializable summary for diagnostic values."""
+    if not values:
+        return {
+            "count": 0,
+            "mean": None,
+            "min": None,
+            "p10": None,
+            "p25": None,
+            "median": None,
+            "p75": None,
+            "p90": None,
+            "max": None,
+        }
+
+    ordered = sorted(float(value) for value in values)
+
+    def percentile(fraction):
+        if len(ordered) == 1:
+            return ordered[0]
+        position = fraction * (len(ordered) - 1)
+        lower = int(position)
+        upper = min(lower + 1, len(ordered) - 1)
+        weight = position - lower
+        return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+    return {
+        "count": len(ordered),
+        "mean": sum(ordered) / len(ordered),
+        "min": ordered[0],
+        "p10": percentile(0.10),
+        "p25": percentile(0.25),
+        "median": percentile(0.50),
+        "p75": percentile(0.75),
+        "p90": percentile(0.90),
+        "max": ordered[-1],
+    }
+
+
+def _mean_summary(total, count):
+    return {
+        "count": count,
+        "mean": total / count if count else None,
+    }
+
+
 def top_p_logits(logits, top_p=None):
     sorted_logits, sorted_indices = torch.sort(logits, descending=True)
     cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
@@ -172,6 +218,59 @@ def _regional_sample(
     stop_low_confidence_candidate_events = 0
     stop_stalled_regions: set[int] = set()
     accepted_stop_position = None
+    startup_candidate_update_events = 0
+    startup_zero_quota_events = 0
+    startup_deferred_update_events = 0
+    startup_confidence_pass_commit_events = 0
+    startup_gap_forced_commit_events = 0
+    startup_global_deadlock_forced_commit_events = 0
+    startup_committed_update_events = 0
+    startup_bootstrap_tokens_committed = 0
+    post_startup_commit_events = 0
+    deferral_window_closed_commit_events = 0
+    global_deadlock_forced_events = 0
+    forwards_with_deferral = 0
+    forwards_with_no_scheduler_commit = 0
+    forwards_with_multiple_committing_regions = 0
+    committing_region_events = 0
+    commit_region_count_histogram = [0 for _ in range(len(states) + 1)]
+    adjacent_progress_gaps = []
+    startup_candidate_min_probabilities = []
+    startup_deferred_min_probabilities = []
+    startup_confidence_pass_min_probabilities = []
+    startup_gap_forced_min_probabilities = []
+    startup_global_forced_min_probabilities = []
+    startup_committed_probability_sum = 0.0
+    startup_committed_probability_count = 0
+    post_startup_committed_probability_sum = 0.0
+    post_startup_committed_probability_count = 0
+    all_committed_probability_sum = 0.0
+    all_committed_probability_count = 0
+    committed_tokens_below_deferral_threshold = 0
+    committed_tokens_at_least_fast_reference = 0
+    startup_attempts = []
+    per_region_startup = []
+    for state in states:
+        startup_target = min(deferral_until_revealed, state.size)
+        per_region_startup.append(
+            {
+                "region_index": state.index,
+                "start": state.start,
+                "end": state.end,
+                "size": state.size,
+                "startup_target_tokens": startup_target,
+                "zero_quota_events": 0,
+                "candidate_update_events": 0,
+                "deferred_update_events": 0,
+                "confidence_pass_commit_events": 0,
+                "gap_forced_commit_events": 0,
+                "global_deadlock_forced_commit_events": 0,
+                "committed_update_events": 0,
+                "bootstrap_tokens_committed": 0,
+                "first_commit_nfe": None,
+                "startup_complete_nfe": 0 if startup_target == 0 else None,
+            }
+        )
     max_iterations = local_steps * (len(states) + 2) * (max_global_deferrals + 1)
 
     while True:
@@ -185,6 +284,19 @@ def _regional_sample(
             int(effective_response_mask[state.start:state.end].sum().item())
             for state in states
         ]
+        actual_remaining = [
+            int(response_mask[state.start:state.end].sum().item())
+            for state in states
+        ]
+        actual_progress = [
+            state.size - value for state, value in zip(states, actual_remaining)
+        ]
+        for parent_index in range(len(states) - 1):
+            child_index = parent_index + 1
+            if remaining[parent_index] > 0 and remaining[child_index] > 0:
+                adjacent_progress_gaps.append(
+                    actual_progress[parent_index] - actual_progress[child_index]
+                )
         logits = model(x, attention_mask, tok_idx).logits
         logits = torch.cat([logits[:, :1], logits[:, :-1]], dim=1)
         logits = generation_logits_hook_func(nfe, x, logits)
@@ -286,8 +398,12 @@ def _regional_sample(
         schedule_held: set[int] = set()
         committed_stop_positions: list[int] = []
         committed_this_forward = 0
+        committing_regions_this_forward: set[int] = set()
         for index in active:
             state = states[index]
+            revealed_before = state.size - remaining[index]
+            startup_target = per_region_startup[index]["startup_target_tokens"]
+            in_startup_window = revealed_before < startup_target
             relative_positions = torch.arange(
                 state.start, state.end, device=x.device, dtype=torch.long
             )
@@ -301,6 +417,22 @@ def _regional_sample(
                 eps=eps,
             )
             if count == 0:
+                if in_startup_window:
+                    startup_zero_quota_events += 1
+                    per_region_startup[index]["zero_quota_events"] += 1
+                    startup_attempts.append(
+                        {
+                            "nfe": nfe,
+                            "region_index": index,
+                            "schedule_step": state.schedule_step,
+                            "revealed_before": revealed_before,
+                            "quota": 0,
+                            "selected_count": 0,
+                            "minimum_top1_probability": None,
+                            "decision": "zero_quota",
+                            "force_reason": forced_reasons.get(index),
+                        }
+                    )
                 state.schedule_step += 1
                 continue
 
@@ -342,6 +474,20 @@ def _regional_sample(
 
             selected_count = min(count, int(selection_pool.numel()))
             if selected_count == 0:
+                if in_startup_window:
+                    startup_attempts.append(
+                        {
+                            "nfe": nfe,
+                            "region_index": index,
+                            "schedule_step": state.schedule_step,
+                            "revealed_before": revealed_before,
+                            "quota": count,
+                            "selected_count": 0,
+                            "minimum_top1_probability": None,
+                            "decision": "stop_protection_hold",
+                            "force_reason": forced_reasons.get(index),
+                        }
+                    )
                 if protected:
                     schedule_held.add(index)
                     stop_protection_events += 1
@@ -375,23 +521,131 @@ def _regional_sample(
 
             selected_relative = relative_positions[chosen]
             selected_absolute = selected_relative + prompt_length
+            selected_top1_probabilities = full_top1_probability[
+                0, selected_absolute
+            ]
             minimum_probability = float(
                 full_top1_probability[0, selected_absolute].min().item()
             )
             force_reason = forced_reasons.get(index)
+            startup_attempt = None
+            if in_startup_window:
+                startup_candidate_update_events += 1
+                per_region_startup[index]["candidate_update_events"] += 1
+                startup_candidate_min_probabilities.append(minimum_probability)
+                startup_attempt = {
+                    "nfe": nfe,
+                    "region_index": index,
+                    "schedule_step": state.schedule_step,
+                    "revealed_before": revealed_before,
+                    "quota": count,
+                    "selected_count": int(selected_absolute.numel()),
+                    "minimum_top1_probability": minimum_probability,
+                    "force_reason": force_reason,
+                }
             if minimum_probability < deferral_threshold and force_reason is None:
                 state.deferrals += 1
                 deferred.add(index)
                 deferral_events += 1
+                if in_startup_window:
+                    startup_deferred_update_events += 1
+                    per_region_startup[index]["deferred_update_events"] += 1
+                    startup_deferred_min_probabilities.append(minimum_probability)
+                    startup_attempt["decision"] = "deferred_low_confidence"
+                    startup_attempts.append(startup_attempt)
                 continue
 
             if minimum_probability < deferral_threshold and force_reason == "gap":
                 gap_forced_events += 1
+            if minimum_probability < deferral_threshold and force_reason == "global_deadlock":
+                global_deadlock_forced_events += 1
+
+            commit_reason = "post_startup"
+            if in_startup_window:
+                startup_committed_update_events += 1
+                per_region_startup[index]["committed_update_events"] += 1
+                if minimum_probability >= deferral_threshold:
+                    commit_reason = "confidence_pass"
+                    startup_confidence_pass_commit_events += 1
+                    per_region_startup[index][
+                        "confidence_pass_commit_events"
+                    ] += 1
+                    startup_confidence_pass_min_probabilities.append(
+                        minimum_probability
+                    )
+                elif force_reason == "gap":
+                    commit_reason = "gap_forced_low_confidence"
+                    startup_gap_forced_commit_events += 1
+                    per_region_startup[index]["gap_forced_commit_events"] += 1
+                    startup_gap_forced_min_probabilities.append(
+                        minimum_probability
+                    )
+                elif force_reason == "global_deadlock":
+                    commit_reason = "global_deadlock_forced_low_confidence"
+                    startup_global_deadlock_forced_commit_events += 1
+                    per_region_startup[index][
+                        "global_deadlock_forced_commit_events"
+                    ] += 1
+                    startup_global_forced_min_probabilities.append(
+                        minimum_probability
+                    )
+                else:
+                    commit_reason = "other_forced_low_confidence"
+                startup_attempt["decision"] = commit_reason
+                startup_attempts.append(startup_attempt)
+            else:
+                post_startup_commit_events += 1
+                if force_reason == "deferral_window_closed":
+                    deferral_window_closed_commit_events += 1
+
             state.deferrals = 0
             x[0, selected_absolute] = full_predictions[0, selected_absolute]
             if index not in schedule_held:
                 state.schedule_step += 1
-            committed_this_forward += int(selected_absolute.numel())
+            committed_count = int(selected_absolute.numel())
+            committed_this_forward += committed_count
+            committing_regions_this_forward.add(index)
+            all_committed_probability_sum += float(
+                selected_top1_probabilities.sum().item()
+            )
+            all_committed_probability_count += committed_count
+            committed_tokens_below_deferral_threshold += int(
+                (selected_top1_probabilities < deferral_threshold).sum().item()
+            )
+            committed_tokens_at_least_fast_reference += int(
+                (selected_top1_probabilities >= 0.9).sum().item()
+            )
+            if in_startup_window:
+                bootstrap_count = min(
+                    committed_count, startup_target - revealed_before
+                )
+                startup_bootstrap_tokens_committed += bootstrap_count
+                per_region_startup[index][
+                    "bootstrap_tokens_committed"
+                ] += bootstrap_count
+                startup_committed_probability_sum += float(
+                    selected_top1_probabilities[:bootstrap_count].sum().item()
+                )
+                startup_committed_probability_count += bootstrap_count
+                if committed_count > bootstrap_count:
+                    post_startup_committed_probability_sum += float(
+                        selected_top1_probabilities[bootstrap_count:].sum().item()
+                    )
+                    post_startup_committed_probability_count += (
+                        committed_count - bootstrap_count
+                    )
+                if per_region_startup[index]["first_commit_nfe"] is None:
+                    per_region_startup[index]["first_commit_nfe"] = nfe
+                if (
+                    revealed_before + committed_count >= startup_target
+                    and per_region_startup[index]["startup_complete_nfe"] is None
+                ):
+                    per_region_startup[index]["startup_complete_nfe"] = nfe
+            else:
+                post_startup_committed_probability_sum += float(
+                    selected_top1_probabilities.sum().item()
+                )
+                post_startup_committed_probability_count += committed_count
             for position in selected_relative.tolist():
                 if int(x[0, prompt_length + position].item()) in eos_token_ids:
                     committed_stop_positions.append(int(position))
@@ -406,6 +660,15 @@ def _regional_sample(
                 accepted_stop_position = earliest_stop
 
         total_committed += committed_this_forward
+        committing_region_count = len(committing_regions_this_forward)
+        commit_region_count_histogram[committing_region_count] += 1
+        committing_region_events += committing_region_count
+        if committing_region_count == 0:
+            forwards_with_no_scheduler_commit += 1
+        if committing_region_count > 1:
+            forwards_with_multiple_committing_regions += 1
+        if deferred:
+            forwards_with_deferral += 1
         if committed_this_forward == 0 and deferred:
             global_empty_deferral_streak += 1
         else:
@@ -422,6 +685,91 @@ def _regional_sample(
     if x.device.type == "cuda":
         torch.cuda.synchronize(x.device)
     elapsed = time.perf_counter() - started_at
+    startup_forced_commit_events = (
+        startup_gap_forced_commit_events
+        + startup_global_deadlock_forced_commit_events
+    )
+    startup_decision_events = (
+        startup_deferred_update_events + startup_committed_update_events
+    )
+    startup_mechanism = {
+        "deferral_threshold": deferral_threshold,
+        "target_revealed_tokens_per_region": deferral_until_revealed,
+        "zero_quota_events": startup_zero_quota_events,
+        "candidate_update_events": startup_candidate_update_events,
+        "decision_events": startup_decision_events,
+        "deferred_update_events": startup_deferred_update_events,
+        "confidence_pass_commit_events": startup_confidence_pass_commit_events,
+        "gap_forced_low_confidence_commit_events": (
+            startup_gap_forced_commit_events
+        ),
+        "global_deadlock_forced_low_confidence_commit_events": (
+            startup_global_deadlock_forced_commit_events
+        ),
+        "forced_low_confidence_commit_events": startup_forced_commit_events,
+        "committed_update_events": startup_committed_update_events,
+        "bootstrap_tokens_committed": startup_bootstrap_tokens_committed,
+        "deferral_rate_per_candidate_update": (
+            startup_deferred_update_events / startup_candidate_update_events
+            if startup_candidate_update_events
+            else None
+        ),
+        "forced_rate_per_committed_update": (
+            startup_forced_commit_events / startup_committed_update_events
+            if startup_committed_update_events
+            else None
+        ),
+        "candidate_min_top1_probability": _number_summary(
+            startup_candidate_min_probabilities
+        ),
+        "deferred_min_top1_probability": _number_summary(
+            startup_deferred_min_probabilities
+        ),
+        "confidence_pass_min_top1_probability": _number_summary(
+            startup_confidence_pass_min_probabilities
+        ),
+        "gap_forced_min_top1_probability": _number_summary(
+            startup_gap_forced_min_probabilities
+        ),
+        "global_forced_min_top1_probability": _number_summary(
+            startup_global_forced_min_probabilities
+        ),
+        "committed_bootstrap_token_top1_probability": _mean_summary(
+            startup_committed_probability_sum,
+            startup_committed_probability_count,
+        ),
+        "per_region": per_region_startup,
+        "attempts": startup_attempts,
+    }
+    concurrency_mechanism = {
+        "committing_region_events": committing_region_events,
+        "mean_committing_regions_per_forward": committing_region_events / nfe,
+        "forwards_with_no_scheduler_commit": forwards_with_no_scheduler_commit,
+        "forwards_with_multiple_committing_regions": (
+            forwards_with_multiple_committing_regions
+        ),
+        "commit_region_count_histogram": commit_region_count_histogram,
+    }
+    commit_confidence = {
+        "all_committed_token_top1_probability": _mean_summary(
+            all_committed_probability_sum,
+            all_committed_probability_count,
+        ),
+        "startup_committed_token_top1_probability": _mean_summary(
+            startup_committed_probability_sum,
+            startup_committed_probability_count,
+        ),
+        "post_startup_committed_token_top1_probability": _mean_summary(
+            post_startup_committed_probability_sum,
+            post_startup_committed_probability_count,
+        ),
+        "committed_tokens_below_deferral_threshold": (
+            committed_tokens_below_deferral_threshold
+        ),
+        "committed_tokens_at_least_fast_reference_0_9": (
+            committed_tokens_at_least_fast_reference
+        ),
+    }
     stats = {
         "algorithm": "regional_balanced",
         "nfe": nfe,
@@ -436,6 +784,12 @@ def _regional_sample(
         "deferral_until_revealed": deferral_until_revealed,
         "deferral_events": deferral_events,
         "gap_forced_events": gap_forced_events,
+        "global_deadlock_forced_events": global_deadlock_forced_events,
+        "forwards_with_deferral": forwards_with_deferral,
+        "post_startup_commit_events": post_startup_commit_events,
+        "deferral_window_closed_commit_events": (
+            deferral_window_closed_commit_events
+        ),
         "blocked_region_events": blocked_region_events,
         "tail_guard_iterations": tail_guard_iterations,
         "stop_mode": stop_mode,
@@ -451,6 +805,19 @@ def _regional_sample(
             if accepted_stop_position is None
             else generation_length - accepted_stop_position - 1
         ),
+        "startup_mechanism": startup_mechanism,
+        "concurrency_mechanism": concurrency_mechanism,
+        "progress_balance": {
+            "adjacent_signed_revealed_token_gap": _number_summary(
+                adjacent_progress_gaps
+            ),
+            "maximum_absolute_adjacent_gap": (
+                max(abs(value) for value in adjacent_progress_gaps)
+                if adjacent_progress_gaps
+                else None
+            ),
+        },
+        "commit_confidence": commit_confidence,
     }
     return x, stats
 

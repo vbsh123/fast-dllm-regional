@@ -469,6 +469,156 @@ class Dream(LM):
                     self.max_new_tokens / mean_seconds if mean_seconds > 0 else None
                 ),
             }
+            regional_stats = [
+                item
+                for item in self.generation_stats
+                if "startup_mechanism" in item
+            ]
+            if regional_stats:
+                startup = [item["startup_mechanism"] for item in regional_stats]
+                concurrency = [
+                    item["concurrency_mechanism"] for item in regional_stats
+                ]
+                confidence = [
+                    item["commit_confidence"] for item in regional_stats
+                ]
+
+                def total(items, key):
+                    return sum(int(item.get(key, 0)) for item in items)
+
+                def ratio(numerator, denominator):
+                    return numerator / denominator if denominator else None
+
+                candidate_events = total(startup, "candidate_update_events")
+                deferred_events = total(startup, "deferred_update_events")
+                committed_events = total(startup, "committed_update_events")
+                gap_forced_events = total(
+                    startup, "gap_forced_low_confidence_commit_events"
+                )
+                global_forced_events = total(
+                    startup,
+                    "global_deadlock_forced_low_confidence_commit_events",
+                )
+                forced_events = gap_forced_events + global_forced_events
+                total_nfe = sum(int(item["nfe"]) for item in regional_stats)
+                committing_region_events = total(
+                    concurrency, "committing_region_events"
+                )
+                empty_forwards = total(
+                    concurrency, "forwards_with_no_scheduler_commit"
+                )
+                multi_region_forwards = total(
+                    concurrency, "forwards_with_multiple_committing_regions"
+                )
+                committed_probability_count = sum(
+                    int(
+                        item["all_committed_token_top1_probability"].get(
+                            "count", 0
+                        )
+                    )
+                    for item in confidence
+                )
+                below_deferral = total(
+                    confidence, "committed_tokens_below_deferral_threshold"
+                )
+                above_fast_reference = total(
+                    confidence,
+                    "committed_tokens_at_least_fast_reference_0_9",
+                )
+                first_commit_nfes = [
+                    region["first_commit_nfe"]
+                    for item in startup
+                    for region in item["per_region"]
+                    if region["first_commit_nfe"] is not None
+                ]
+                startup_complete_nfes = [
+                    region["startup_complete_nfe"]
+                    for item in startup
+                    for region in item["per_region"]
+                    if region["startup_complete_nfe"] is not None
+                ]
+                configurations = {
+                    (
+                        item["region_size"],
+                        item["local_steps"],
+                        item["max_progress_gap"],
+                        item["deferral_threshold"],
+                        item["deferral_until_revealed"],
+                        item["stop_mode"],
+                    )
+                    for item in regional_stats
+                }
+                generation_summary["regional_mechanism"] = {
+                    "configurations": [
+                        {
+                            "region_size": config[0],
+                            "local_steps": config[1],
+                            "max_progress_gap": config[2],
+                            "deferral_threshold": config[3],
+                            "deferral_until_revealed": config[4],
+                            "stop_mode": config[5],
+                        }
+                        for config in sorted(configurations, key=str)
+                    ],
+                    "startup_candidate_update_events": candidate_events,
+                    "startup_deferred_update_events": deferred_events,
+                    "startup_confidence_pass_commit_events": total(
+                        startup, "confidence_pass_commit_events"
+                    ),
+                    "startup_gap_forced_low_confidence_commit_events": (
+                        gap_forced_events
+                    ),
+                    "startup_global_forced_low_confidence_commit_events": (
+                        global_forced_events
+                    ),
+                    "startup_bootstrap_tokens_committed": total(
+                        startup, "bootstrap_tokens_committed"
+                    ),
+                    "startup_deferral_rate": ratio(
+                        deferred_events, candidate_events
+                    ),
+                    "startup_forced_rate_per_committed_update": ratio(
+                        forced_events, committed_events
+                    ),
+                    "mean_first_commit_nfe": (
+                        sum(first_commit_nfes) / len(first_commit_nfes)
+                        if first_commit_nfes
+                        else None
+                    ),
+                    "mean_startup_complete_nfe": (
+                        sum(startup_complete_nfes) / len(startup_complete_nfes)
+                        if startup_complete_nfes
+                        else None
+                    ),
+                    "mean_committing_regions_per_forward": ratio(
+                        committing_region_events, total_nfe
+                    ),
+                    "fraction_forwards_with_multiple_committing_regions": ratio(
+                        multi_region_forwards, total_nfe
+                    ),
+                    "fraction_forwards_with_no_scheduler_commit": ratio(
+                        empty_forwards, total_nfe
+                    ),
+                    "fraction_committed_tokens_below_deferral_threshold": ratio(
+                        below_deferral, committed_probability_count
+                    ),
+                    "fraction_committed_tokens_at_least_fast_reference_0_9": ratio(
+                        above_fast_reference, committed_probability_count
+                    ),
+                    "maximum_absolute_adjacent_progress_gap": max(
+                        (
+                            item["progress_balance"].get(
+                                "maximum_absolute_adjacent_gap"
+                            )
+                            for item in regional_stats
+                            if item["progress_balance"].get(
+                                "maximum_absolute_adjacent_gap"
+                            )
+                            is not None
+                        ),
+                        default=None,
+                    ),
+                }
             print(
                 "generation_summary: "
                 + json.dumps(generation_summary, sort_keys=True)

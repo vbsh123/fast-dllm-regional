@@ -38,6 +38,54 @@ the direct control. The regional path intentionally rejects `use_cache=true`:
 Fast-dLLM's prefix/dual cache assumes a sequential active block, whereas this
 pilot can change tokens in many regions after every full-canvas forward.
 
+## Mechanism telemetry
+
+Every regional `generation_stats` record includes four diagnostic sections:
+
+- `startup_mechanism`: every zero-quota, deferred, confidence-passed,
+  gap-forced, and global-deadlock-forced bootstrap update, plus per-region
+  first-commit/startup-completion NFEs and the minimum raw top-1 probability
+  that controlled each decision;
+- `concurrency_mechanism`: how many distinct regions actually committed on
+  each forward and how often no region or multiple regions committed;
+- `progress_balance`: observed adjacent revealed-token gaps;
+- `commit_confidence`: the mean raw top-1 probability of startup,
+  post-startup, and all committed tokens, including the fractions below the
+  regional deferral threshold and above Fast-dLLM's `0.9` reference threshold.
+
+The detailed `startup_mechanism.attempts` list is deliberately restricted to
+the configured bootstrap window. It records repeated attempts while a region
+still has fewer than the configured number of revealed tokens; it does not
+confuse repeated deferrals with distinct tokens.
+
+Summarize one or more run logs without printing prompts or responses:
+
+```bash
+python scripts/summarize_regional_mechanism.py logs/regional_filter_50.log
+```
+
+The run script's documented leading defaults are 32-token regions, 32 local
+steps, a four-token maximum progress gap, a `0.4` startup threshold, and a
+two-token bootstrap window. They can be overridden without editing code. Use
+`RUN_TAG` whenever changing settings so lm-eval output directories do not
+collide:
+
+```bash
+REGION_SIZE=40 \
+LOCAL_STEPS=32 \
+MAX_PROGRESS_GAP=8 \
+DEFERRAL_THRESHOLD=0.4 \
+DEFERRAL_UNTIL_REVEALED=4 \
+RUN_TAG=r40_d4_g8 \
+LIMIT=50 \
+bash scripts/run_gsm8k_regional.sh regional_filter
+```
+
+The expanded `40/4/8` setting is an ablation transferred from the earlier
+pilot, not a verified Fast-dLLM-protocol winner. Keep it separate from the
+documented `32/2/4` default until a paired validation run establishes that it
+transfers to Dream Base with the five-shot prompt.
+
 ## Vast setup
 
 From the repository root:
@@ -58,6 +106,16 @@ First run the two-example smoke test:
 
 ```bash
 LIMIT=2 bash scripts/run_gsm8k_regional.sh regional
+```
+
+For the higher-accuracy terminal variant used in the leading prior
+large-sample comparison, smoke-test `regional_filter` as well:
+
+```bash
+mkdir -p logs
+LIMIT=2 bash scripts/run_gsm8k_regional.sh regional_filter \
+  > logs/regional_filter_2.log 2>&1
+python scripts/summarize_regional_mechanism.py logs/regional_filter_2.log
 ```
 
 Then run the matched 50-example Fast-dLLM paper protocol separately for each
