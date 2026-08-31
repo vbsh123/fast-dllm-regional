@@ -376,7 +376,9 @@ class Dream(LM):
 
         generation_stats = getattr(generation_ids, "stats", None)
         if generation_stats is not None:
-            self.generation_stats.append(dict(generation_stats))
+            generation_stats = dict(generation_stats)
+            generation_stats["generation_index"] = len(self.generation_stats)
+            self.generation_stats.append(generation_stats)
             print("generation_stats: " + json.dumps(generation_stats, sort_keys=True))
 
         # decode
