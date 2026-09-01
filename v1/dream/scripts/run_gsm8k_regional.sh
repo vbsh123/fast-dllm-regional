@@ -19,9 +19,23 @@ TASK=${TASK:-gsm8k}
 NUM_FEWSHOT=${NUM_FEWSHOT:-5}
 ESCAPE_UNTIL=${ESCAPE_UNTIL:-false}
 CONFIRM_RUN_UNSAFE_CODE=${CONFIRM_RUN_UNSAFE_CODE:-false}
+DTYPE=${DTYPE:-}
+TEMPERATURE=${TEMPERATURE:-0.0}
+TOP_P=${TOP_P:-}
+TOP_K=${TOP_K:-}
+APPLY_CHAT_TEMPLATE=${APPLY_CHAT_TEMPLATE:-false}
 
 REGIONAL_ARGS="regional_region_size=${REGION_SIZE},regional_local_steps=${LOCAL_STEPS},regional_max_progress_gap=${MAX_PROGRESS_GAP},regional_deferral_threshold=${DEFERRAL_THRESHOLD},regional_deferral_until_revealed=${DEFERRAL_UNTIL_REVEALED},regional_max_region_deferrals=${MAX_REGION_DEFERRALS},regional_max_global_deferrals=${MAX_GLOBAL_DEFERRALS},regional_commit_policy=entropy"
-COMMON_ARGS="pretrained=${MODEL},max_new_tokens=${LENGTH},add_bos_token=true,escape_until=${ESCAPE_UNTIL}"
+COMMON_ARGS="pretrained=${MODEL},max_new_tokens=${LENGTH},add_bos_token=true,escape_until=${ESCAPE_UNTIL},temperature=${TEMPERATURE},apply_chat_template=${APPLY_CHAT_TEMPLATE}"
+if [[ -n "$DTYPE" ]]; then
+  COMMON_ARGS="${COMMON_ARGS},dtype=${DTYPE}"
+fi
+if [[ -n "$TOP_P" ]]; then
+  COMMON_ARGS="${COMMON_ARGS},top_p=${TOP_P}"
+fi
+if [[ -n "$TOP_K" ]]; then
+  COMMON_ARGS="${COMMON_ARGS},top_k=${TOP_K}"
+fi
 
 case "$METHOD" in
   vanilla)
