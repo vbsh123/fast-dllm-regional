@@ -8,7 +8,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # uncapped behavior; override it explicitly for capped-deferral ablations.
 export MODEL=${MODEL:-Dream-org/Dream-v0-Instruct-7B}
 export TASK=gsm8k_cot
-export NUM_FEWSHOT=0
+export NUM_FEWSHOT=${NUM_FEWSHOT:-0}
 export LENGTH=${LENGTH:-256}
 export DTYPE=${DTYPE:-bfloat16}
 export TEMPERATURE=${TEMPERATURE:-0.1}
