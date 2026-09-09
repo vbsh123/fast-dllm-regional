@@ -88,6 +88,9 @@ class Dream(LM):
         regional_stop_mode: Optional[str] = None,
         regional_stop_filter_threshold: Optional[float] = 0.7,
         regional_commit_policy: Optional[str] = "entropy",
+        fast_stop_filter: Optional[bool] = False,
+        fast_stop_region_size: Optional[int] = 32,
+        fast_stop_filter_threshold: Optional[float] = 0.7,
         save_dir: Optional[str] = None,
         **kwargs,
     ) -> None:
@@ -237,6 +240,17 @@ class Dream(LM):
             regional_stop_filter_threshold
         )
         self.regional_commit_policy = str(regional_commit_policy)
+        self.fast_stop_filter = bool(fast_stop_filter)
+        self.fast_stop_region_size = int(fast_stop_region_size)
+        self.fast_stop_filter_threshold = float(fast_stop_filter_threshold)
+        if self.fast_stop_region_size <= 0:
+            raise ValueError("fast_stop_region_size must be positive")
+        if not 0.0 <= self.fast_stop_filter_threshold <= 1.0:
+            raise ValueError("fast_stop_filter_threshold must be in [0, 1]")
+        if self.fast_stop_filter and self.alg != "confidence_threshold":
+            raise ValueError(
+                "fast_stop_filter is only supported with alg=confidence_threshold"
+            )
         if self.alg == "regional_balanced" and self.use_cache:
             raise ValueError(
                 "regional_balanced uses full-canvas updates and is not compatible "
@@ -368,6 +382,20 @@ class Dream(LM):
             regional_stop_mode=self.regional_stop_mode,
             regional_stop_filter_threshold=self.regional_stop_filter_threshold,
             regional_commit_policy=self.regional_commit_policy,
+            fast_stop_filter=self.fast_stop_filter,
+            fast_stop_region_size=self.fast_stop_region_size,
+            fast_stop_filter_threshold=self.fast_stop_filter_threshold,
+            fast_stop_token_ids=[
+                int(token_id)
+                for token_id in {
+                    self.tokenizer.eos_token_id,
+                    *(
+                        self.tokenizer.get_vocab().get(marker)
+                        for marker in ("<|eot_id|>", "<|im_end|>")
+                    ),
+                }
+                if token_id is not None
+            ],
             regional_stop_token_ids=[
                 int(token_id)
                 for token_id in {
@@ -642,6 +670,58 @@ class Dream(LM):
                             is not None
                         ),
                         default=None,
+                    ),
+                }
+            fast_stop_stats = [
+                item
+                for item in self.generation_stats
+                if item.get("fast_stop_filter") is True
+            ]
+            if fast_stop_stats:
+                generation_summary["fast_stop_filter"] = {
+                    "region_sizes": sorted(
+                        {int(item["stop_region_size"]) for item in fast_stop_stats}
+                    ),
+                    "thresholds": sorted(
+                        {
+                            float(item["stop_filter_threshold"])
+                            for item in fast_stop_stats
+                        }
+                    ),
+                    "mean_protection_iterations": (
+                        sum(
+                            int(item["stop_protection_iterations"])
+                            for item in fast_stop_stats
+                        )
+                        / len(fast_stop_stats)
+                    ),
+                    "mean_filtered_stop_candidates": (
+                        sum(
+                            int(item["filtered_stop_candidate_events"])
+                            for item in fast_stop_stats
+                        )
+                        / len(fast_stop_stats)
+                    ),
+                    "mean_filtered_low_confidence_candidates": (
+                        sum(
+                            int(item["filtered_low_confidence_candidate_events"])
+                            for item in fast_stop_stats
+                        )
+                        / len(fast_stop_stats)
+                    ),
+                    "early_stop_termination_rate": (
+                        sum(
+                            item["accepted_stop_position"] is not None
+                            for item in fast_stop_stats
+                        )
+                        / len(fast_stop_stats)
+                    ),
+                    "mean_ignored_suffix_tokens": (
+                        sum(
+                            int(item["ignored_suffix_tokens"])
+                            for item in fast_stop_stats
+                        )
+                        / len(fast_stop_stats)
                     ),
                 }
             print(

@@ -147,6 +147,91 @@ def sample_tokens(logits, temperature=0.0, top_p=None, top_k=None, margin_confid
     return confidence, x0
 
 
+def fast_stop_filter_eligibility(
+    response_mask,
+    raw_predictions,
+    proposed_predictions,
+    proposed_probabilities,
+    *,
+    stop_token_ids,
+    region_size,
+    confidence_threshold,
+):
+    """Return positions eligible for Fast-dLLM's global selection.
+
+    This mirrors the regional ``filter`` stop protection without adding a
+    regional scheduler. If the earliest predicted stop lies in a region with
+    unfinished regions to its left, stop predictions and low-confidence
+    alternatives in that one region are temporarily ineligible. Every other
+    masked position remains globally selectable by Fast-dLLM.
+    """
+    if response_mask.ndim != 1:
+        raise ValueError("response_mask must be one-dimensional")
+    if region_size <= 0:
+        raise ValueError("region_size must be positive")
+    if not 0.0 <= confidence_threshold <= 1.0:
+        raise ValueError("confidence_threshold must be in [0, 1]")
+    if not (
+        raw_predictions.shape
+        == proposed_predictions.shape
+        == proposed_probabilities.shape
+        == response_mask.shape
+    ):
+        raise ValueError("all Fast stop-filter inputs must have the same shape")
+
+    eligible = response_mask.clone()
+    result = {
+        "guarded_region": None,
+        "predicted_stop_position": None,
+        "filtered_stop_candidates": 0,
+        "filtered_low_confidence_candidates": 0,
+    }
+    stop_token_ids = {int(token_id) for token_id in stop_token_ids}
+    if not stop_token_ids:
+        return eligible, result
+
+    raw_stop = torch.zeros_like(response_mask, dtype=torch.bool)
+    for token_id in stop_token_ids:
+        raw_stop |= raw_predictions == token_id
+    predicted_stops = torch.nonzero(
+        response_mask & raw_stop, as_tuple=False
+    ).flatten()
+    if predicted_stops.numel() == 0:
+        return eligible, result
+
+    stop_position = int(predicted_stops[0].item())
+    guarded_region = stop_position // region_size
+    guarded_start = guarded_region * region_size
+    if guarded_start == 0 or not bool(response_mask[:guarded_start].any()):
+        return eligible, result
+
+    guarded_end = min(guarded_start + region_size, response_mask.numel())
+    in_guarded_region = torch.zeros_like(response_mask, dtype=torch.bool)
+    in_guarded_region[guarded_start:guarded_end] = True
+    proposed_stop = torch.zeros_like(response_mask, dtype=torch.bool)
+    for token_id in stop_token_ids:
+        proposed_stop |= proposed_predictions == token_id
+    filtered_stop = response_mask & in_guarded_region & proposed_stop
+    filtered_low_confidence = (
+        response_mask
+        & in_guarded_region
+        & ~proposed_stop
+        & (proposed_probabilities < confidence_threshold)
+    )
+    eligible &= ~(filtered_stop | filtered_low_confidence)
+    result.update(
+        {
+            "guarded_region": guarded_region,
+            "predicted_stop_position": stop_position,
+            "filtered_stop_candidates": int(filtered_stop.sum().item()),
+            "filtered_low_confidence_candidates": int(
+                filtered_low_confidence.sum().item()
+            ),
+        }
+    )
+    return eligible, result
+
+
 @dataclass
 class DreamModelOutput(ModelOutput):
     sequences: torch.LongTensor = None
@@ -1155,6 +1240,14 @@ class DreamGenerationMixin:
             "commit_policy": str(kwargs.get("regional_commit_policy", "entropy")),
             "extra_stop_token_ids": kwargs.get("regional_stop_token_ids", []),
         }
+        fast_options = {
+            "stop_filter": bool(kwargs.get("fast_stop_filter", False)),
+            "region_size": int(kwargs.get("fast_stop_region_size", 32)),
+            "stop_filter_threshold": float(
+                kwargs.get("fast_stop_filter_threshold", 0.7)
+            ),
+            "stop_token_ids": kwargs.get("fast_stop_token_ids", []),
+        }
 
         result = self._sample(
             input_ids,
@@ -1164,6 +1257,7 @@ class DreamGenerationMixin:
             generation_logits_hook_func=generation_logits_hook_func,
             threshold=threshold,
             regional_options=regional_options,
+            fast_options=fast_options,
         )
         return result
 
@@ -1176,6 +1270,7 @@ class DreamGenerationMixin:
         generation_logits_hook_func,
         threshold: Optional[float] = 0.9,
         regional_options: Optional[Dict[str, Any]] = None,
+        fast_options: Optional[Dict[str, Any]] = None,
     ) -> Union[DreamModelOutput, torch.LongTensor]:
         # init values
         output_history = generation_config.output_history
@@ -1217,6 +1312,35 @@ class DreamGenerationMixin:
 
         # this allows user-defined token control of the intermediate steps
         x = generation_tokens_hook_func(None, x, None)
+        fast_options = dict(fast_options or {})
+        fast_stop_filter = bool(fast_options.get("stop_filter", False))
+        if fast_stop_filter and alg != "confidence_threshold":
+            raise ValueError("fast_stop_filter requires alg=confidence_threshold")
+        fast_stop_region_size = int(fast_options.get("region_size", 32))
+        fast_stop_filter_threshold = float(
+            fast_options.get("stop_filter_threshold", 0.7)
+        )
+        if fast_stop_region_size <= 0:
+            raise ValueError("fast_stop_region_size must be positive")
+        if not 0.0 <= fast_stop_filter_threshold <= 1.0:
+            raise ValueError("fast_stop_filter_threshold must be in [0, 1]")
+        fast_stop_token_ids = {
+            int(token_id)
+            for token_id in fast_options.get("stop_token_ids", [])
+        }
+        if fast_stop_filter:
+            eos_tensor = getattr(generation_config, "_eos_token_tensor", None)
+            if eos_tensor is not None:
+                fast_stop_token_ids.update(
+                    int(token_id)
+                    for token_id in eos_tensor.reshape(-1).tolist()
+                )
+        accepted_stop_position = None
+        fast_stop_protection_iterations = 0
+        fast_filtered_stop_candidate_events = 0
+        fast_filtered_low_confidence_candidate_events = 0
+        fast_filtered_quota_tokens = 0
+        fast_tokens_committed = 0
         if alg == "regional_balanced":
             regional_options = dict(regional_options or {})
             eos_tensor = getattr(generation_config, "_eos_token_tensor", None)
@@ -1258,6 +1382,11 @@ class DreamGenerationMixin:
             left_tokens_last_step = 0
         while i < steps:
             mask_index = (x == mask_token_id)
+            if fast_stop_filter and accepted_stop_position is not None:
+                response_cutoff = input_ids.shape[1] + accepted_stop_position
+                mask_index[:, response_cutoff:] = False
+                if not bool(mask_index.any()):
+                    break
             logits = self(x, attention_mask, tok_idx).logits
             logits = torch.cat([logits[:,:1], logits[:, :-1]], dim=1)
 
@@ -1282,12 +1411,81 @@ class DreamGenerationMixin:
                 full_confidence = torch.full_like(x, -torch.inf, device=self.device, dtype=logits.dtype)
                 full_confidence[mask_index] = confidence
                 current_transfer_tokens = number_transfer_tokens + left_tokens_last_step
+                if fast_stop_filter and accepted_stop_position is not None:
+                    # Once a stop has been accepted, suffix masks are no longer
+                    # part of the generation target. Do not carry their old
+                    # fixed-canvas quota into the remaining prefix.
+                    current_transfer_tokens = min(
+                        current_transfer_tokens,
+                        int(mask_index.sum().item()),
+                    )
                 left_tokens_last_step = 0
-                selected_confidence, select_index = torch.topk(full_confidence, current_transfer_tokens)
+                selection_confidence = full_confidence
+                if fast_stop_filter and accepted_stop_position is None:
+                    raw_probabilities = mask_logits.float().softmax(dim=-1)
+                    proposed_probabilities = raw_probabilities.gather(
+                        -1, x0.unsqueeze(-1)
+                    ).squeeze(-1)
+                    full_proposed_probabilities = torch.zeros_like(
+                        x, dtype=torch.float32
+                    )
+                    full_proposed_probabilities[mask_index] = proposed_probabilities
+                    raw_predictions = logits.argmax(dim=-1)
+                    response_start = input_ids.shape[1]
+                    eligible_response, stop_filter_stats = (
+                        fast_stop_filter_eligibility(
+                            mask_index[0, response_start:],
+                            raw_predictions[0, response_start:],
+                            x_[0, response_start:],
+                            full_proposed_probabilities[0, response_start:],
+                            stop_token_ids=fast_stop_token_ids,
+                            region_size=fast_stop_region_size,
+                            confidence_threshold=fast_stop_filter_threshold,
+                        )
+                    )
+                    if stop_filter_stats["guarded_region"] is not None:
+                        fast_stop_protection_iterations += 1
+                    fast_filtered_stop_candidate_events += stop_filter_stats[
+                        "filtered_stop_candidates"
+                    ]
+                    fast_filtered_low_confidence_candidate_events += (
+                        stop_filter_stats[
+                            "filtered_low_confidence_candidates"
+                        ]
+                    )
+                    eligible = mask_index.clone()
+                    eligible[0, response_start:] = eligible_response
+                    selection_confidence = full_confidence.masked_fill(
+                        ~eligible, -torch.inf
+                    )
+
+                eligible_count = int(
+                    torch.isfinite(selection_confidence).sum().item()
+                )
+                selected_count = min(current_transfer_tokens, eligible_count)
+                missing_quota = current_transfer_tokens - selected_count
+                if missing_quota:
+                    fast_filtered_quota_tokens += missing_quota
+                    left_tokens_last_step += missing_quota
+                    if i >= steps - 1:
+                        number_transfer_tokens = 0
+                        steps += 1
                 transfer_index = torch.zeros_like(x, device=x.device, dtype=torch.bool)
-                select_index = select_index.to(x.device)
-                transfer_index[0, select_index[0]] = True
-                for k in range(1, current_transfer_tokens):
+                if selected_count:
+                    selected_confidence, select_index = torch.topk(
+                        selection_confidence, selected_count
+                    )
+                    select_index = select_index.to(x.device)
+                    transfer_index[0, select_index[0]] = True
+                else:
+                    selected_confidence = selection_confidence[:, :0]
+                    select_index = torch.empty(
+                        (1, 0), device=x.device, dtype=torch.long
+                    )
+                # Preserve native Fast-dLLM's progress guarantee: its most
+                # confident eligible candidate is committed even below the
+                # global confidence threshold.
+                for k in range(1, selected_count):
                     if selected_confidence[0, k] < threshold:
                         if i < steps - 1:
                             left_tokens_last_step += 1
@@ -1299,6 +1497,24 @@ class DreamGenerationMixin:
                             transfer_index[0, select_index[0, k]] = False
 
                 x[transfer_index] = x_[transfer_index].clone()
+                committed_count = int(transfer_index.sum().item())
+                fast_tokens_committed += committed_count
+                if fast_stop_filter and committed_count:
+                    committed_stops = torch.zeros_like(
+                        transfer_index[0], dtype=torch.bool
+                    )
+                    for token_id in fast_stop_token_ids:
+                        committed_stops |= transfer_index[0] & (x_[0] == token_id)
+                    response_stops = torch.nonzero(
+                        committed_stops[input_ids.shape[1]:], as_tuple=False
+                    ).flatten()
+                    if response_stops.numel() > 0:
+                        earliest_stop = int(response_stops[0].item())
+                        if (
+                            accepted_stop_position is None
+                            or earliest_stop < accepted_stop_position
+                        ):
+                            accepted_stop_position = earliest_stop
 
             else:
                 if alg == 'maskgit_plus':
@@ -1335,14 +1551,57 @@ class DreamGenerationMixin:
         if x.device.type == "cuda":
             torch.cuda.synchronize(x.device)
         elapsed = time.perf_counter() - start_time
+        reported_nfe = i
         stats = {
-            "algorithm": alg,
-            "nfe": steps,
+            "algorithm": (
+                "confidence_threshold_stop_filter"
+                if fast_stop_filter
+                else alg
+            ),
+            "nfe": reported_nfe,
             "wall_clock_seconds": elapsed,
-            "tokens_committed": initial_mask_tokens,
-            "average_tokens_committed_per_forward": initial_mask_tokens / steps,
+            "tokens_committed": (
+                fast_tokens_committed
+                if fast_stop_filter
+                else initial_mask_tokens
+            ),
+            "average_tokens_committed_per_forward": (
+                (
+                    fast_tokens_committed
+                    if fast_stop_filter
+                    else initial_mask_tokens
+                )
+                / reported_nfe
+            ),
         }
-        print(f'used steps: {steps}')
+        if fast_stop_filter:
+            stats.update(
+                {
+                    "fast_stop_filter": True,
+                    "stop_region_size": fast_stop_region_size,
+                    "stop_filter_threshold": fast_stop_filter_threshold,
+                    "stop_protection_iterations": (
+                        fast_stop_protection_iterations
+                    ),
+                    "filtered_stop_candidate_events": (
+                        fast_filtered_stop_candidate_events
+                    ),
+                    "filtered_low_confidence_candidate_events": (
+                        fast_filtered_low_confidence_candidate_events
+                    ),
+                    "filtered_quota_tokens": fast_filtered_quota_tokens,
+                    "accepted_stop_position": accepted_stop_position,
+                    "ignored_suffix_tokens": (
+                        0
+                        if accepted_stop_position is None
+                        else max_length
+                        - input_ids.shape[1]
+                        - accepted_stop_position
+                        - 1
+                    ),
+                }
+            )
+        print(f'used steps: {reported_nfe}')
         print(f'used time: {elapsed}')
         if return_dict_in_generate:
             return DreamModelOutput(
