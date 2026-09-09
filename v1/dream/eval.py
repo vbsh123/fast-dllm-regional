@@ -91,6 +91,7 @@ class Dream(LM):
         fast_stop_filter: Optional[bool] = False,
         fast_stop_region_size: Optional[int] = 32,
         fast_stop_filter_threshold: Optional[float] = 0.7,
+        fast_stop_trim_suffix: Optional[bool] = False,
         save_dir: Optional[str] = None,
         **kwargs,
     ) -> None:
@@ -243,6 +244,7 @@ class Dream(LM):
         self.fast_stop_filter = bool(fast_stop_filter)
         self.fast_stop_region_size = int(fast_stop_region_size)
         self.fast_stop_filter_threshold = float(fast_stop_filter_threshold)
+        self.fast_stop_trim_suffix = bool(fast_stop_trim_suffix)
         if self.fast_stop_region_size <= 0:
             raise ValueError("fast_stop_region_size must be positive")
         if not 0.0 <= self.fast_stop_filter_threshold <= 1.0:
@@ -385,6 +387,7 @@ class Dream(LM):
             fast_stop_filter=self.fast_stop_filter,
             fast_stop_region_size=self.fast_stop_region_size,
             fast_stop_filter_threshold=self.fast_stop_filter_threshold,
+            fast_stop_trim_suffix=self.fast_stop_trim_suffix,
             fast_stop_token_ids=[
                 int(token_id)
                 for token_id in {
@@ -688,6 +691,12 @@ class Dream(LM):
                             for item in fast_stop_stats
                         }
                     ),
+                    "trim_suffix_values": sorted(
+                        {
+                            bool(item["trim_suffix"])
+                            for item in fast_stop_stats
+                        }
+                    ),
                     "mean_protection_iterations": (
                         sum(
                             int(item["stop_protection_iterations"])
@@ -709,9 +718,24 @@ class Dream(LM):
                         )
                         / len(fast_stop_stats)
                     ),
-                    "early_stop_termination_rate": (
+                    "accepted_stop_rate": (
                         sum(
                             item["accepted_stop_position"] is not None
+                            for item in fast_stop_stats
+                        )
+                        / len(fast_stop_stats)
+                    ),
+                    "suffix_trim_rate": (
+                        sum(
+                            bool(item["trim_suffix"])
+                            and item["accepted_stop_position"] is not None
+                            for item in fast_stop_stats
+                        )
+                        / len(fast_stop_stats)
+                    ),
+                    "mean_potential_suffix_tokens": (
+                        sum(
+                            int(item["potential_suffix_tokens"])
                             for item in fast_stop_stats
                         )
                         / len(fast_stop_stats)

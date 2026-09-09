@@ -45,7 +45,10 @@ case "$METHOD" in
     MODEL_ARGS="${COMMON_ARGS},diffusion_steps=8,alg=confidence_threshold,threshold=0.9,use_cache=false"
     ;;
   fast_filter)
-    MODEL_ARGS="${COMMON_ARGS},diffusion_steps=8,alg=confidence_threshold,threshold=0.9,use_cache=false,fast_stop_filter=true,fast_stop_region_size=${REGION_SIZE},fast_stop_filter_threshold=${STOP_FILTER_THRESHOLD}"
+    MODEL_ARGS="${COMMON_ARGS},diffusion_steps=8,alg=confidence_threshold,threshold=0.9,use_cache=false,fast_stop_filter=true,fast_stop_region_size=${REGION_SIZE},fast_stop_filter_threshold=${STOP_FILTER_THRESHOLD},fast_stop_trim_suffix=false"
+    ;;
+  fast_filter_trim)
+    MODEL_ARGS="${COMMON_ARGS},diffusion_steps=8,alg=confidence_threshold,threshold=0.9,use_cache=false,fast_stop_filter=true,fast_stop_region_size=${REGION_SIZE},fast_stop_filter_threshold=${STOP_FILTER_THRESHOLD},fast_stop_trim_suffix=true"
     ;;
   fast_cache)
     MODEL_ARGS="${COMMON_ARGS},diffusion_steps=8,alg=confidence_threshold,threshold=0.9,use_cache=true,dual_cache=true"
@@ -60,7 +63,7 @@ case "$METHOD" in
     MODEL_ARGS="${COMMON_ARGS},diffusion_steps=${LENGTH},alg=regional_balanced,use_cache=false,${REGIONAL_ARGS},regional_stop_mode=defer,regional_stop_filter_threshold=${STOP_FILTER_THRESHOLD}"
     ;;
   *)
-    echo "usage: $0 {vanilla|fast|fast_filter|fast_cache|regional|regional_filter|regional_defer}" >&2
+    echo "usage: $0 {vanilla|fast|fast_filter|fast_filter_trim|fast_cache|regional|regional_filter|regional_defer}" >&2
     exit 2
     ;;
 esac

@@ -1247,6 +1247,7 @@ class DreamGenerationMixin:
                 kwargs.get("fast_stop_filter_threshold", 0.7)
             ),
             "stop_token_ids": kwargs.get("fast_stop_token_ids", []),
+            "trim_suffix": bool(kwargs.get("fast_stop_trim_suffix", False)),
         }
 
         result = self._sample(
@@ -1320,6 +1321,7 @@ class DreamGenerationMixin:
         fast_stop_filter_threshold = float(
             fast_options.get("stop_filter_threshold", 0.7)
         )
+        fast_stop_trim_suffix = bool(fast_options.get("trim_suffix", False))
         if fast_stop_region_size <= 0:
             raise ValueError("fast_stop_region_size must be positive")
         if not 0.0 <= fast_stop_filter_threshold <= 1.0:
@@ -1382,7 +1384,11 @@ class DreamGenerationMixin:
             left_tokens_last_step = 0
         while i < steps:
             mask_index = (x == mask_token_id)
-            if fast_stop_filter and accepted_stop_position is not None:
+            if (
+                fast_stop_filter
+                and fast_stop_trim_suffix
+                and accepted_stop_position is not None
+            ):
                 response_cutoff = input_ids.shape[1] + accepted_stop_position
                 mask_index[:, response_cutoff:] = False
                 if not bool(mask_index.any()):
@@ -1411,7 +1417,11 @@ class DreamGenerationMixin:
                 full_confidence = torch.full_like(x, -torch.inf, device=self.device, dtype=logits.dtype)
                 full_confidence[mask_index] = confidence
                 current_transfer_tokens = number_transfer_tokens + left_tokens_last_step
-                if fast_stop_filter and accepted_stop_position is not None:
+                if (
+                    fast_stop_filter
+                    and fast_stop_trim_suffix
+                    and accepted_stop_position is not None
+                ):
                     # Once a stop has been accepted, suffix masks are no longer
                     # part of the generation target. Do not carry their old
                     # fixed-canvas quota into the remaining prefix.
@@ -1580,6 +1590,7 @@ class DreamGenerationMixin:
                     "fast_stop_filter": True,
                     "stop_region_size": fast_stop_region_size,
                     "stop_filter_threshold": fast_stop_filter_threshold,
+                    "trim_suffix": fast_stop_trim_suffix,
                     "stop_protection_iterations": (
                         fast_stop_protection_iterations
                     ),
@@ -1591,9 +1602,20 @@ class DreamGenerationMixin:
                     ),
                     "filtered_quota_tokens": fast_filtered_quota_tokens,
                     "accepted_stop_position": accepted_stop_position,
-                    "ignored_suffix_tokens": (
+                    "potential_suffix_tokens": (
                         0
                         if accepted_stop_position is None
+                        else max_length
+                        - input_ids.shape[1]
+                        - accepted_stop_position
+                        - 1
+                    ),
+                    "ignored_suffix_tokens": (
+                        0
+                        if (
+                            accepted_stop_position is None
+                            or not fast_stop_trim_suffix
+                        )
                         else max_length
                         - input_ids.shape[1]
                         - accepted_stop_position
