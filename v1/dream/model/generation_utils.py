@@ -431,11 +431,14 @@ def _regional_sample(
             predicted_stop = torch.zeros_like(response_predictions, dtype=torch.bool)
             for token_id in eos_token_ids:
                 predicted_stop |= response_predictions == token_id
+                # Sampling can propose EOS even when raw top-1 is non-EOS.
+                predicted_stop |= full_predictions[0, prompt_length:] == token_id
             stop_candidates = torch.nonzero(
                 effective_response_mask & predicted_stop, as_tuple=False
             )
-            if stop_candidates.numel() > 0:
-                stop_position = int(stop_candidates[0, 0].item())
+            # An unguarded stop in R0 must not hide a later stop in a region
+            # whose predecessors are still unfinished.
+            for stop_position in stop_candidates.flatten().tolist():
                 candidate_tail = next(
                     state.index
                     for state in states
@@ -444,6 +447,7 @@ def _regional_sample(
                 if any(value > 0 for value in remaining[:candidate_tail]):
                     guarded_tail = candidate_tail
                     tail_guard_iterations += 1
+                    break
 
         max_region_exclusive = None
         if guarded_tail is not None:
@@ -471,6 +475,7 @@ def _regional_sample(
             max_progress_gap=max_progress_gap,
             max_region_exclusive=max_region_exclusive,
             progress_gap_exempt_children=set(stop_stalled_regions),
+            revealed_tokens=actual_progress,
         )
         blocked_region_events += len(blocked)
         if not active:
@@ -481,9 +486,10 @@ def _regional_sample(
 
         forced_reasons = {index: "gap" for index in urgent}
         for index in active:
+            # Ignored post-EOS masks are not actual token commitments.
             local_force_reason = startup_force_reason(
                 states[index],
-                remaining_masks=remaining[index],
+                remaining_masks=actual_remaining[index],
                 deferral_until_revealed=deferral_until_revealed,
                 max_region_deferrals=max_region_deferrals,
             )
@@ -499,7 +505,7 @@ def _regional_sample(
         committing_regions_this_forward: set[int] = set()
         for index in active:
             state = states[index]
-            revealed_before = state.size - remaining[index]
+            revealed_before = actual_progress[index]
             startup_target = per_region_startup[index]["startup_target_tokens"]
             in_startup_window = revealed_before < startup_target
             relative_positions = torch.arange(

@@ -347,9 +347,12 @@ class Dream(LM):
                 prompts = [self.tokenizer.bos_token + p for p in prompts]
         # tokenize
         prompt_ids = self.tokenizer(prompts, return_tensors="pt", padding=True, padding_side="left").input_ids
-        if len(prompt_ids) > self.max_length-self.max_new_tokens:
-            eval_logger.warning(f"Prompt length {len(prompt_ids)} is larger than {self.max_length-self.max_new_tokens}, cutoff on the left side")
-            prompt_ids = prompt_ids[-(self.max_length-self.max_new_tokens):]
+        prompt_budget = self.max_length - self.max_new_tokens
+        if prompt_budget <= 0:
+            raise ValueError("max_new_tokens must be smaller than max_length")
+        if prompt_ids.shape[1] > prompt_budget:
+            eval_logger.warning(f"Prompt length {prompt_ids.shape[1]} is larger than {prompt_budget}, cutoff on the left side")
+            prompt_ids = prompt_ids[:, -prompt_budget:]
 
         attn_mask = prompt_ids.ne(self.tokenizer.pad_token_id)
         prompt_ids = prompt_ids.to(device=self.device)

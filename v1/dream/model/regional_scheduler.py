@@ -85,6 +85,7 @@ def controlled_regions(
     max_progress_gap: int,
     max_region_exclusive: int | None = None,
     progress_gap_exempt_children: set[int] | None = None,
+    revealed_tokens: list[int] | None = None,
 ) -> tuple[list[int], set[int], set[int]]:
     """Return active, blocked, and urgency-forced region indices.
 
@@ -107,7 +108,15 @@ def controlled_regions(
     }
     blocked: set[int] = set()
     urgent: set[int] = set()
-    progress = [state.size - remaining for state, remaining in zip(states, remaining_masks)]
+    # Remaining work may exclude a discarded post-EOS suffix. Such masks
+    # must not count as revealed tokens when enforcing the progress bound.
+    if revealed_tokens is not None and len(revealed_tokens) != len(states):
+        raise ValueError("revealed_tokens must contain one value per region")
+    progress = (
+        revealed_tokens
+        if revealed_tokens is not None
+        else [state.size - remaining for state, remaining in zip(states, remaining_masks)]
+    )
 
     for parent_index in range(len(states) - 1):
         child_index = parent_index + 1
